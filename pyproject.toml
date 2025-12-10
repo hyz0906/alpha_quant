@@ -1,0 +1,29 @@
+[project]
+name = "AlphaQuant"
+version = "0.1.0"
+description = "AlphaQuant: Agent-Optimized Quantitative Investment System"
+authors = [
+    {name = "Your Name", email = "your.email@example.com"},
+]
+dependencies = [
+    "pandas>=2.0.0",
+    "numpy>=1.24.0",
+    "sqlalchemy>=2.0.0",
+    "psycopg2-binary>=2.9.0",
+    "redis>=4.0.0",
+    "pydantic-settings>=2.0.0",
+    "tushare>=1.2.89",
+    "akshare>=1.10.0",
+    "backtrader>=1.9.78.123",
+    "openai>=1.0.0",
+    "loguru>=0.7.0",
+]
+requires-python = ">=3.10"
+
+[build-system]
+requires = ["poetry-core>=1.0.0"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = "test_*.py"
