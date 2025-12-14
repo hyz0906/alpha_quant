@@ -26,3 +26,12 @@ class ReportSentiment(Base):
     summary = Column(Text)
     key_risks = Column(Text) # JSON string or delimited
     growth_logic = Column(Text) # JSON string or delimited
+
+class FactorData(Base):
+    __tablename__ = "factor_data"
+    
+    ts_code = Column(String, primary_key=True, index=True)
+    trade_date = Column(Date, primary_key=True, index=True)
+    rsrs_beta = Column(Float)
+    rsrs_zscore = Column(Float)
+    rsrs_r2 = Column(Float)

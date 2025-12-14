@@ -1,6 +1,6 @@
 import pytest
 from unittest.mock import MagicMock, patch
-from src.analysis.llm_agent import ResearchAgent
+from src.llm_agent.analyzer import ResearchAgent
 
 def test_analyze_text_mock():
     # Mock OpenAI client

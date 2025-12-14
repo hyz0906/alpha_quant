@@ -1,7 +1,7 @@
 import pytest
 import pandas as pd
 import numpy as np
-from src.strategies.rsrs_momentum import RSRSCalculator
+from src.strategies.factors.rsrs import RSRSCalculator
 
 def test_rsrs_perfect_correlation():
     # Create synthetic data where High = 2 * Low + 10

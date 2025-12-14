@@ -1,192 +1,225 @@
-# Project Blueprint: AlphaQuant (Agent-Optimized Edition)
-
-> **Meta-Instructions for Coding Agent:**
->
-> 1.  **Single Source of Truth**: This document is the absolute specification. Do not deviate from the directory structure or variable naming conventions defined here.
-> 2.  **Test-Driven Development (TDD)**: For every module, generate the unit test file *before* or *simultaneously* with the implementation code.
-> 3.  **Environment**: Assume Python 3.10+ in a Linux/WSL environment.
-> 4.  **Incremental Execution**: Execute tasks in the order defined in Section 4. Do not jump ahead.
+1.  **原子化任务 (Atomic Tasks)**：将大目标拆解为 AI 可独立执行的最小单元。
+2.  **上下文锚定 (Context Anchoring)**：明确文件路径、依赖库版本和输入/输出接口。
+3.  **伪代码即规范 (Pseudocode as Spec)**：对核心逻辑（如 IOPV 计算、RSRS 择时）提供数学到代码的直接映射，防止 AI 幻觉。
 
 -----
 
-## 1\. Project Manifest & Directory Structure
+# System Manifest: Quantamental-Pro (Full Stack Quant System)
 
-**Strictly** adhere to this file tree. Create empty `__init__.py` files where necessary.
+**Target Executor**: Autonomous Coding Agent
+**Project Root**: `/workspace/quant_system`
+**Environment**: Python 3.10+, Docker (PostgreSQL/Redis)
+
+## 0\. 全局配置与上下文 (Global Context)
+
+### 0.1 技术栈锁定 (Tech Stack Lock)
+
+  * **Data**: `tushare`, `akshare`, `sqlalchemy`, `psycopg2-binary`, `redis`
+  * **Calc**: `pandas`, `numpy`, `scipy`
+  * **Strategy**: `backtrader`
+  * **AI**: `openai` (compatible SDK for DeepSeek), `pymupdf4llm`
+  * **Web**: `streamlit` (Phase 3 Dashboard)
+  * **Execution**: `xtquant` (Mocked for Linux dev env, Deployment on Windows)
+
+### 0.2 目录结构规范 (Master Directory Tree)
+
+Agent **必须** 严格遵守此文件结构，不得随意创建根目录文件。
 
 ```text
-AlphaQuant/
-├── .env.example                # Template for API keys (DeepSeek, Tushare) and DB URLs
-├── pyproject.toml              # Dependency management (Poetry/Setuptools)
-├── docker-compose.yml          # Postgres & Redis services
+/workspace/quant_system
+├── .env.example                # 环境变量模板
+├── docker-compose.yml          # PG & Redis 基础设施
+├── requirements.txt
 ├── config/
-│   ├── __init__.py
-│   └── settings.py             # Pydantic based settings loading
+│   ├── settings.py             # 读取 env 并导出配置对象
+│   └── logging_config.py       # 日志配置
 ├── src/
-│   ├── __init__.py
 │   ├── database/
-│   │   ├── __init__.py
-│   │   ├── connection.py       # SQLAlchemy Sync/Async Engine
-│   │   └── models.py           # SQLModels/SQLAlchemy ORM classes
+│   │   ├── models.py           # SQLAlchemy Schema
+│   │   └── connection.py       # DB Session Manager
 │   ├── data_engine/
-│   │   ├── __init__.py
-│   │   ├── tushare_loader.py   # Historical data ETL
-│   │   └── realtime_feed.py    # AkShare & IOPV calculation
+│   │   ├── tushare_loader.py   # 历史数据同步
+│   │   ├── realtime_feed.py    # AkShare 实时流
+│   │   └── qdii_calc.py        # IOPV 计算器
 │   ├── strategies/
-│   │   ├── __init__.py
-│   │   ├── base.py             # Abstract Strategy Class
-│   │   └── rsrs_momentum.py    # RSRS + Dual Momentum implementation
-│   ├── analysis/
-│   │   ├── __init__.py
-│   │   └── llm_agent.py        # DeepSeek API integration
+│   │   ├── factors/
+│   │   │   └── rsrs.py         # RSRS 因子库
+│   │   └── signal_generator.py # 信号生成逻辑
 │   ├── backtest/
-│   │   ├── __init__.py
-│   │   └── engine.py           # Backtrader wrapper
+│   │   ├── feeds.py            # 自定义 DataFeed
+│   │   └── engine.py           # Backtrader 运行入口
+│   ├── llm_agent/
+│   │   ├── crawler.py          # 研报爬虫
+│   │   └── analyzer.py         # DeepSeek 接口
 │   └── execution/
-│   │   ├── __init__.py
-│   │   └── qmt_gateway.py      # MiniQMT Bridge
-└── tests/                      # Mirror the src structure
-    ├── test_data_engine.py
-    ├── test_strategies.py
-    └── ...
+│       ├── qmt_client.py       # MiniQMT 封装
+│       └── risk_manager.py     # 风控模块
+└── main.py                     # CLI 入口
 ```
 
 -----
 
-## 2\. Environment Specifications
+## Phase 1: Infrastructure & Data Logic (Task ID: P1-xx)
 
-### 2.1 Core Dependencies (`pyproject.toml`)
+### [P1-01] 基础设施搭建
 
-Agent, ensure these libraries are installed:
+  * **Action**: 创建 `docker-compose.yml`。
+  * **Spec**:
+      * Service 1: `postgres:15` (Port 5432, User/Pass from env).
+      * Service 2: `redis:7` (Port 6379).
+  * **Action**: 创建 `src/database/models.py`。
+  * **Schema Spec**:
+      * `MarketData`: `ts_code(PK), trade_date(PK), open, high, low, close, vol`
+      * `FactorData`: `ts_code(PK), trade_date(PK), rsrs_beta, rsrs_zscore, rsrs_r2`
 
-  * `pandas >= 2.0.0`
-  * `numpy >= 1.24.0`
-  * `sqlalchemy >= 2.0.0`
-  * `psycopg2-binary` (Postgres driver)
-  * `redis`
-  * `pydantic-settings`
-  * `tushare`, `akshare`
-  * `backtrader` (Note: Fix matplotlib compatibility if error occurs)
-  * `openai` (Standard SDK compatible with DeepSeek)
-  * `loguru` (For structured logging)
+### [P1-02] Tushare 数据管道
 
-### 2.2 Infrastructure (`docker-compose.yml`)
+  * **File**: `src/data_engine/tushare_loader.py`
+  * **Function**: `sync_daily_data(ts_code, start_date, end_date)`
+  * **Logic**:
+    1.  初始化 Tushare Pro API。
+    2.  调用 `daily` 接口获取行情。
+    3.  调用 `adj_factor` 获取复权因子。
+    4.  计算**前复权 (Forward Adjusted)** 价格。
+    5.  使用 `pandas.to_sql` (method='multi') 批量写入 `MarketData` 表。
+    6.  **Constraint**: 必须处理重复主键冲突 (Upsert logic)。
 
-Generate a docker-compose file with:
+### [P1-03] RSRS 因子核心算法 (向量化)
 
-  * **Service: db**: Image `postgres:15`, Ports `5432:5432`.
-  * **Service: cache**: Image `redis:7`, Ports `6379:6379`.
+  * **File**: `src/strategies/factors/rsrs.py`
+  * **Function**: `calculate_rsrs_vectorized(df: pd.DataFrame, N=18, M=600) -> pd.DataFrame`
+  * **Logic (Strict)**:
+    1.  **Input**: DataFrame 必须包含 `high`, `low`。
+    2.  **Rolling Regression**:
+          * 使用 `numpy.lib.stride_tricks.sliding_window_view` 构建滚动窗口，避免循环。
+          * 对每个窗口执行 OLS 回归: $High = \beta \times Low + \alpha$。
+          * 提取 $\beta$ (斜率) 和 $R^2$。
+    3.  **Z-Score**: `z_score = (beta - rolling_mean(beta, M)) / rolling_std(beta, M)`
+    4.  **Correction**: `rsrs_score = z_score * r2 * sign(z_score)`
+    5.  **Output**: 返回添加了 `rsrs_score` 列的 DataFrame。
 
------
+### [P1-04] 混合周期回测框架
 
-## 3\. Module Specifications & Interface Definitions
-
-### 3.1 Data Layer (`src/database/models.py`)
-
-**Instruction**: Use `SQLAlchemy` Declarative Base.
-
-  * **Table 1: `MarketData`**
-
-      * `ts_code` (String, PK)
-      * `trade_date` (Date, PK)
-      * `open`, `high`, `low`, `close`, `vol` (Float)
-      * `rsrs_beta` (Float, Nullable, Index=True)
-
-  * **Table 2: `ReportSentiment`**
-
-      * `id` (Integer, AutoInc)
-      * `ts_code` (String)
-      * `publish_date` (Date)
-      * `title` (String)
-      * `sentiment_score` (Float) - Range [-1.0, 1.0]
-      * `summary` (Text)
-
-### 3.2 Strategy Core (`src/strategies`)
-
-**File: `src/strategies/rsrs_momentum.py`**
-Implement a class `RSRSCalculator` with vectorized numpy operations.
-
-```python
-# Interface Definition
-class RSRSCalculator:
-    def __init__(self, n: int = 18, m: int = 600):
-        pass
-
-    def process(self, df: pd.DataFrame) -> pd.DataFrame:
-        """
-        Input: DataFrame with ['high', 'low']
-        Output: DataFrame with added columns ['beta', 'r2', 'rsrs_zscore']
-        Logic: 
-          1. Rolling OLS regression of High ~ Low over window N.
-          2. Calculate Z-Score of Beta over window M.
-          3. Apply R2 correction.
-        """
-        pass
-```
-
-### 3.3 LLM Agent (`src/analysis/llm_agent.py`)
-
-**Instruction**: Create a class `ResearchAgent` wrapping the DeepSeek API.
-
-  * **Method**: `analyze_text(text: str) -> dict`
-  * **Prompt Template**:
-    ```text
-    Role: Financial Analyst. 
-    Task: Analyze the provided report text.
-    Output JSON keys: 
-    - sentiment_score (float, -1.0 to 1.0)
-    - key_risks (list of strings)
-    - growth_logic (list of strings)
-    ```
+  * **File**: `src/backtest/feeds.py`
+  * **Class**: `HybridPandasData(bt.feeds.PandasData)`
+  * **Spec**:
+      * 增加 lines: `('rsrs_score', 'market_type')`
+      * `market_type`: 0=A股(T+1), 1=QDII(T+0)。
+  * **File**: `src/backtest/engine.py`
+  * **Class**: `HybridStrategy(bt.Strategy)`
+  * **Logic**:
+      * 在 `next()` 中，若 `d.market_type == 0` (A股)，使用默认下单。
+      * 若 `d.market_type == 1` (QDII)，开启 `broker.set_coo(True)` (Cheat-On-Open) 模拟 T+0 或在回测引擎层手动处理日内平仓逻辑。
 
 -----
 
-## 4\. Execution Sequence (Task Queue for Agent)
+## Phase 2: Live Execution & Arbitrage (Task ID: P2-xx)
 
-**Agent, please execute the following tasks sequentially. Do not proceed to the next task until the verification step passes.**
+### [P2-01] QDII 影子净值计算器
 
-### Task 01: Scaffold & Infrastructure
+  * **File**: `src/data_engine/qdii_calc.py`
+  * **Function**: `get_realtime_premium(etf_code, benchmark_future_symbol)`
+  * **Logic**:
+    1.  Fetch `Last_NAV` (T-1 净值) from DB.
+    2.  Fetch `Realtime_Future_Pct` (美股期货涨跌) via AkShare (`ak.futures_foreign_commodity_realtime`).
+    3.  Fetch `USD_CNY` rate via AkShare.
+    4.  **Formula**:
+        $$IOPV_{now} = NAV_{last} \times (1 + Future\%) \times \frac{Rate_{now}}{Rate_{base}}$$
+        $$Premium = \frac{Price_{market}}{IOPV_{now}} - 1$$
+    5.  **Output**: Float (溢价率，如 0.02 代表 2%)。
 
-  * **Action**: Create the directory structure, `pyproject.toml`, and `docker-compose.yml`. Start the Docker services.
-  * **Verification**: Run `docker compose ps` and ensure DB/Redis are healthy.
+### [P2-02] MiniQMT 交互层 (Mockable)
 
-### Task 02: Database Layer
+  * **File**: `src/execution/qmt_client.py`
+  * **Design**:
+      * 由于开发环境可能无 MiniQMT，需创建一个 `BaseTrader` 接口。
+      * 实现 `RealTrader` (调用 `xtquant`) 和 `MockTrader` (仅打印日志)。
+      * **Method**: `place_order(code, amount, action, strategy_id)`
+      * **Method**: `get_positions()`
+  * **Constraint**: 所有交易指令必须先推送到 Redis 队列 `trade_instruction_queue`，由该脚本作为 Consumer 消费执行。
 
-  * **Action**: Implement `src/database/connection.py` and `models.py`. Create a script `scripts/init_db.py` to create tables.
-  * **Verification**: Run `pytest tests/test_db_connect.py` (You must create this test to insert and query a dummy record).
+### [P2-03] 自动化调度器
 
-### Task 03: RSRS Logic Implementation
-
-  * **Action**: Implement `src/strategies/rsrs_momentum.py`. Use `numpy` for vectorized regression (do not use loops).
-  * **Verification**: Create `tests/test_rsrs.py`. Input a synthetic DataFrame where `High = 2 * Low` (perfect correlation). Assert that `r2` is close to 1.0 and `beta` is close to 2.0.
-
-### Task 04: Data Ingestion (Tushare)
-
-  * **Action**: Implement `src/data_engine/tushare_loader.py`. It should fetch daily bars and upsert them into Postgres. Handle duplicates using `ON CONFLICT DO UPDATE`.
-  * **Verification**: Fetch data for `000001.SZ` for the last 5 days. Check DB count.
-
-### Task 05: LLM Connector
-
-  * **Action**: Implement `src/analysis/llm_agent.py`. Use `pydantic-settings` to load `DEEPSEEK_API_KEY`. Mock the API call in tests.
-  * **Verification**: Run `pytest tests/test_llm.py` with a mocked response to ensure JSON parsing works.
-
-### Task 06: Backtrader Integration
-
-  * **Action**: Implement `src/backtest/engine.py`.
-      * Create a custom `PandasData` feed that maps the DB columns (especially `rsrs_beta`) to Backtrader lines.
-      * Implement the Strategy class that buys if `rsrs_zscore > 0.7`.
-  * **Verification**: Run a backtest on the data fetched in Task 04. Output the final portfolio value.
-
-### Task 07: Execution Gateway (Stub)
-
-  * **Action**: Implement `src/execution/qmt_gateway.py`.
-      * Since MiniQMT requires Windows, create a **Mock Class** `MockTrader` that logs orders to a file (`logs/orders.log`) and Redis channel (`trade_signal`).
-  * **Verification**: Call `MockTrader.buy("000001.SZ", 100)`. Check if the log file exists and contains the order.
+  * **File**: `main.py` (Command Pattern)
+  * **Commands**:
+      * `python main.py update_data`: 运行 Tushare Loader。
+      * `python main.py calc_factors`: 运行 RSRS 计算并更新 DB。
+      * `python main.py monitor`: 启动死循环，每 3 秒计算一次 QDII 溢价，若 `abs(premium) > 0.03`，触发 Redis 报警信号。
 
 -----
 
-## 5\. Coding Standards (Style Guide)
+## Phase 3: AI Agent & Quantamental (Task ID: P3-xx)
 
-  * **Type Hinting**: All function signatures must have Python 3.10+ type hints.
-  * **Docstrings**: Use Google-style docstrings.
-  * **Error Handling**: Never swallow exceptions silently. Use `loguru` to log errors with stack traces.
-  * **Config**: No hardcoded credentials. All secrets must come from `os.getenv`.
+### [P3-01] 研报处理 Pipeline
+
+  * **File**: `src/llm_agent/crawler.py`
+  * **Action**: 使用 `requests` 获取东方财富研报 PDF URL（模拟 Headers 必不可少）。
+  * **File**: `src/llm_agent/converter.py`
+  * **Action**: 使用 `pymupdf4llm.to_markdown(pdf_path)` 将 PDF 转为 Markdown。
+
+### [P3-02] DeepSeek 分析器
+
+  * **File**: `src/llm_agent/analyzer.py`
+  * **Function**: `analyze_report(markdown_text)`
+  * **Spec**:
+      * Client: `openai.OpenAI(base_url="https://api.deepseek.com", api_key=...)`
+      * **System Prompt**:
+        ```text
+        你是一个严谨的量化基本面分析师。请分析研报并输出 JSON:
+        {
+          "sentiment": float (-1.0 to 1.0),
+          "confidence": float (0.0 to 1.0),
+          "key_drivers": ["string"],
+          "risks": ["string"]
+        }
+        ```
+      * **Constraint**: 必须使用 JSON Mode (`response_format={"type": "json_object"}`) 确保程序可解析。
+
+### [P3-03] 信号融合 (Signal Fusion)
+
+  * **File**: `src/strategies/signal_generator.py`
+  * **Logic**:
+      * 读取 `FactorData` 中的 RSRS Score。
+      * 读取 `ReportSentiment` 中的 Sentiment Score。
+      * **Fusion Logic**:
+        ```python
+        if rsrs > 0.7 and sentiment > 0.2:
+            signal = "STRONG_BUY"
+        elif rsrs > 0.7 and sentiment < -0.2:
+            signal = "DIVERGENCE_WATCH" # 技术面好但基本面差，减仓观察
+        else:
+            signal = "HOLD/SELL"
+        ```
+
+### [P3-04] Streamlit Dashboard
+
+  * **File**: `src/dashboard/app.py`
+  * **Action**:
+      * Page 1: **Market Monitor**. 显示 QDII 实时溢价表 (Auto-refresh every 10s)。
+      * Page 2: **Backtest Viewer**. 上传回测结果 Pickle，绘制 pnl 曲线。
+      * Page 3: **AI Reports**. 展示最近分析的研报及其 Sentiment 打分。
+
+-----
+
+## Execution Guide for Coding Agent
+
+**Step 1: Initialization**
+Run `mkdir -p` commands to create the directory tree. create `requirements.txt` with specified libraries.
+
+**Step 2: Database Layer**
+Implement `models.py` and bring up Docker containers. Verify connection string.
+
+**Step 3: Data Ingestion**
+Implement `tushare_loader.py`. *Verification*: Run script to fetch '000001.SZ' for last 30 days and query DB to confirm data.
+
+**Step 4: Strategy Logic**
+Implement `rsrs.py`. *Verification*: Create a dummy CSV with clear uptrend, check if `rsrs_score` \> 0.8.
+
+**Step 5: AI Integration**
+Implement `analyzer.py`. *Verification*: Pass a dummy text "Company profit doubled" to DeepSeek API and verify JSON output contains positive sentiment.
+
+**Step 6: System Integration**
+Tie everything together in `main.py` with CLI arguments (`argparse`).
+
+**Step 7: Real Trading Simulation**
+Implement `qmt_client.py` with Mock mode enabled. Simulate a "Buy" signal flow from Strategy -\> Redis -\> Execution -\> Log.

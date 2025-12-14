@@ -1,23 +1,17 @@
 import backtrader as bt
 import pandas as pd
 from datetime import datetime
-from tushare import pro_api
-from src.database.connection import get_db, engine
-from src.database.models import MarketData
 from sqlalchemy.orm import Session
-from src.strategies.rsrs_momentum import RSRSCalculator
-from loguru import logger
+from src.database.connection import engine
+from src.database.models import MarketData
+from src.strategies.factors.rsrs import RSRSCalculator
+from src.backtest.feeds import HybridPandasData
+from config.logging_config import setup_logging
 
-# Custom Feed
-class PandasDataPlus(bt.feeds.PandasData):
-    lines = ('rsrs_zscore', 'rsrs_beta', )
-    params = (
-        ('rsrs_zscore', -1),
-        ('rsrs_beta', -1),
-    )
+logger = setup_logging()
 
-# Strategy
-class RSRSStrategy(bt.Strategy):
+# Strategy with Hybrid Logic [P1-04]
+class HybridStrategy(bt.Strategy):
     params = (
         ('buy_threshold', 0.7),
         ('sell_threshold', -0.7),
@@ -29,23 +23,32 @@ class RSRSStrategy(bt.Strategy):
 
     def __init__(self):
         self.dataclose = self.datas[0].close
-        self.rsrs_zscore = self.datas[0].rsrs_zscore
+        self.rsrs_score = self.datas[0].rsrs_score
+        self.market_type = self.datas[0].market_type
         self.order = None
 
     def next(self):
         if self.order:
             return
 
-        # Check if we are in the market
+        # Market Type Logic
+        # 0 = A Share (T+1), 1 = QDII (T+0)
+        # Backtrader default is T+0 allowed unless cheat-on-close is disabled for T+1?
+        # Design doc: "if market_type == 1 (QDII), set_coo(True)?" 
+        # Actually set_coo is per broker setting, not per data/bar easily without hack.
+        # But we can simulate logically.
+        
+        current_type = self.market_type[0]
+        score = self.rsrs_score[0]
+        
+        # Simple Logic
         if not self.position:
-            # Buy signal
-            if self.rsrs_zscore[0] > self.params.buy_threshold:
-                self.log(f'BUY CREATE, {self.dataclose[0]:.2f}, Score: {self.rsrs_zscore[0]:.2f}')
+            if score > self.params.buy_threshold:
+                self.log(f'BUY CREATE ({current_type}), {self.dataclose[0]:.2f}, Score: {score:.2f}')
                 self.order = self.buy()
         else:
-            # Sell signal
-            if self.rsrs_zscore[0] < self.params.sell_threshold:
-                self.log(f'SELL CREATE, {self.dataclose[0]:.2f}, Score: {self.rsrs_zscore[0]:.2f}')
+            if score < self.params.sell_threshold:
+                self.log(f'SELL CREATE ({current_type}), {self.dataclose[0]:.2f}, Score: {score:.2f}')
                 self.order = self.sell()
 
 class BacktestEngine:
@@ -56,7 +59,6 @@ class BacktestEngine:
         self.cerebro = bt.Cerebro()
 
     def load_data(self):
-        # Fetch data from DB
         with Session(engine) as session:
             query = session.query(MarketData).filter(
                 MarketData.ts_code == self.ts_code,
@@ -74,10 +76,8 @@ class BacktestEngine:
                     'close': row.close,
                     'volume': row.vol,
                     'openinterest': 0,
-                    # Calculate RSRS on the fly if not in DB, but better to have it pre-calculated
-                    # Here we assume it is populated or we calc it now
-                    'high_raw': row.high,
-                    'low_raw': row.low
+                    # Dummy market type (0=A-Share default)
+                    'market_type': 0 
                 })
             
             if not data:
@@ -87,20 +87,18 @@ class BacktestEngine:
             df = pd.DataFrame(data)
             df.set_index('datetime', inplace=True)
             
-            # Calculate RSRS if missing (in a real flow, this might be a separate ETL step)
-            # We'll run calculator here to ensure columns exist
+            # Calculate RSRS
             calc = RSRSCalculator()
-            df = calc.process(df)
+            df = calc.calculate_rsrs_vectorized(df) # Logic moved to this method
             
-            # Fill NaNs for Backtrader
             df = df.fillna(0)
             
-            # Add to Cerebro
-            data_feed = PandasDataPlus(dataname=df)
+            # Add to Cerebro using Hybrid Feed
+            data_feed = HybridPandasData(dataname=df)
             self.cerebro.adddata(data_feed)
 
     def run(self):
-        self.cerebro.addstrategy(RSRSStrategy)
+        self.cerebro.addstrategy(HybridStrategy)
         self.cerebro.broker.setcash(100000.0)
         
         logger.info(f'Starting Portfolio Value: {self.cerebro.broker.getvalue():.2f}')
