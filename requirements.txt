@@ -1,0 +1,16 @@
+pandas
+numpy
+scipy
+sqlalchemy
+redis
+tushare
+akshare
+backtrader
+openai
+loguru
+pydantic-settings
+pymupdf4llm
+streamlit
+plotly
+altair
+requests
