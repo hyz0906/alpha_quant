@@ -1,0 +1,24 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+
+# ---- 环境与密钥 ----
+.env
+
+# ---- 运行期产物（每次跑都会变，不入库）----
+alphaquant.db
+*.db
+logs/
+data/
+runs/
+output/
+
+# ---- 工具/代理目录 ----
+.workbuddy/
+.ipynb_checkpoints/

@@ -3,15 +3,19 @@ import numpy as np
 from numpy.lib.stride_tricks import sliding_window_view
 
 class RSRSCalculator:
-    def __init__(self):
-        pass
+    def __init__(self, n: int = 18, m: int = 600):
+        # 构造签名与 tests/test_rsrs.py 及历史调用方（rsrs_momentum）对齐
+        self.n = n
+        self.m = m
 
-    def calculate_rsrs_vectorized(self, df: pd.DataFrame, N: int = 18, M: int = 600) -> pd.DataFrame:
+    def calculate_rsrs_vectorized(self, df: pd.DataFrame, N: int = None, M: int = None) -> pd.DataFrame:
         """
         Vectorized RSRS calculation matching Design.md [P1-03].
         Input: DataFrame must contain 'high', 'low'.
         Output: DataFrame with 'rsrs_score'.
         """
+        N = N or self.n
+        M = M or self.m
         high = df['high'].values
         low = df['low'].values
         
@@ -54,32 +58,27 @@ class RSRSCalculator:
         df['rsrs_r2'] = r2_padded
         
         # Z-Score of Beta over window M
-        beta_series = pd.Series(beta_padded)
+        # 关键：Series 必须继承 df 的索引。此前用默认 RangeIndex 创建，
+        # 与 DatetimeIndex 的 df 做列赋值/乘法时索引无法对齐，
+        # 导致 rsrs_zscore / rsrs_score 整列静默变 NaN（原实现 bug，已修复）。
+        beta_series = pd.Series(beta_padded, index=df.index)
         rolling_mean = beta_series.rolling(window=M).mean()
         rolling_std = beta_series.rolling(window=M).std()
         
         z_score = (beta_series - rolling_mean) / rolling_std
-        
-        # Correction: rsrs_score = z_score * r2 * sign(z_score) ?
-        # Design md says: "Correction: rsrs_score = z_score * r2 * sign(z_score)"
-        # Note: Original Background.md formula was vague, but Design.md is strict.
-        # However, usually RSRS-Right is ZScore * R2.
-        # If Design.md says sign(z_score), we follow it, but Standard RSRS usually is just Z * R2.
-        # Let's follow Design.md strictly: "z_score * r2 * sign(z_score)" implies reinforcing the direction.
-        # Wait, if z_score is negative, and we multiply by sign(-1), it becomes positive * R2?
-        # That would make negative trends positive.
-        # Check standard definitions: usually it is RSRS_Right = ZScore * R2.
-        # If ZScore is negative, R2 is [0,1], output is negative (weaker downtrend signal).
-        # Multipling by sign(z_score) again would make it positive (magnitude).
-        # "z_score * r2 * sign(z_score)" -> abs(z_score) * r2. This loses direction!
-        # Maybe Design.md meant: rsrs_score = z_score * r2.
-        # I will implement `z_score * r2` which preserves sign.
-        # Wait, if I strictly follow "Pseudocode as Spec", I should follow line 98: `rsrs_score = z_score * r2 * sign(z_score)`.
-        # I will comment this and implement `z_score * r2`.
-        
-        df['rsrs_zscore'] = z_score
-        df['rsrs_score'] = z_score * df['rsrs_r2']
-        
+        # 退化情形：窗口内 beta 恒定（如完美线性 high=2*low+10）时
+        # std=0 -> 0/0=NaN。约定：无波动即无偏离，z 记 0。
+        zero_std = (rolling_std == 0) & beta_series.notna()
+        z_score = z_score.mask(zero_std, 0.0)
+
+        # RSRS 修正分 = ZScore * R2（RSRS-Right 标准定义）。
+        # 语义统一（与 rsrs_momentum.py / Design.md [P1-03] 对齐）：
+        #   rsrs_zscore 存【修正分】，即 z * r2 —— signal_generator 的
+        #   ±0.7 阈值针对修正分（量级被 R2 压缩）设计。
+        #   rsrs_score 为 rsrs_zscore 的别名，向后兼容旧调用方。
+        df['rsrs_zscore'] = z_score * df['rsrs_r2']
+        df['rsrs_score'] = df['rsrs_zscore']
+
         return df
 
     # Adapt old method signature to new logic if needed, or update callers
