@@ -210,6 +210,128 @@ class SignalEngine:
 '''
 
 
+TIMING_ENGINE_TEMPLATE = '''"""AlphaQuant RSRS 择时信号引擎（由 vibe_exporter 生成）。
+
+单标的滞回择时（hysteresis）：RSRS 修正分上穿 ENTRY 开仓、下穿 EXIT 平仓，
+两阈值之间维持原状态，避免边界抖动导致频繁换手。
+每个标的独立择时，持仓时分配 1/n_codes 资金（可叠加，最多满仓）。
+状态机在整条数据轴（含 warmup）上运行，评估起点前的仓位被置零但状态保留，
+窗口首日的持仓状态由此前真实数据决定，无前视偏差。
+"""
+
+
+class SignalEngine:
+    N = __N__
+    M = __M__
+    MIN_PERIODS = __MIN_PERIODS__
+    ENTRY = __ENTRY__
+    EXIT = __EXIT__
+    EVAL_START = "__EVAL_START__"
+
+    def generate(self, data_map):
+        import pandas as pd
+
+        n_codes = max(len(data_map), 1)
+        unit = 1.0 / n_codes
+        out = {}
+        for code, df in data_map.items():
+            score = self._rsrs_score(df, self.N, self.M, self.MIN_PERIODS)
+            weights = pd.Series(0.0, index=score.index)
+            state = False
+            for i, v in enumerate(score.to_numpy()):
+                if pd.notna(v):
+                    if not state and v > self.ENTRY:
+                        state = True
+                    elif state and v < self.EXIT:
+                        state = False
+                weights.iloc[i] = unit if state else 0.0
+            # 评估起点之前强制空仓：warmup 段不参与交易
+            if self.EVAL_START:
+                cutoff = pd.Timestamp(self.EVAL_START)
+                weights.loc[weights.index < cutoff] = 0.0
+            out[code] = weights
+        return out
+
+    def _rsrs_score(self, df, n, m, min_periods):
+        """向量化 RSRS：sliding_window_view OLS + M 期 Z-Score + R2 修正。"""
+        import numpy as np
+        import pandas as pd
+
+        high = df["high"].to_numpy(dtype=float)
+        low = df["low"].to_numpy(dtype=float)
+        if len(df) < n + 2:
+            return pd.Series(float("nan"), index=df.index)
+
+        x_win = np.lib.stride_tricks.sliding_window_view(low, n)
+        y_win = np.lib.stride_tricks.sliding_window_view(high, n)
+        x_mean = x_win.mean(axis=1, keepdims=True)
+        y_mean = y_win.mean(axis=1, keepdims=True)
+        numerator = ((x_win - x_mean) * (y_win - y_mean)).sum(axis=1)
+        denominator = ((x_win - x_mean) ** 2).sum(axis=1)
+        beta = np.divide(
+            numerator, denominator,
+            out=np.full_like(numerator, float("nan")),
+            where=denominator != 0,
+        )
+        x_std = x_win.std(axis=1)
+        y_std = y_win.std(axis=1)
+        corr = np.divide(
+            numerator / n, x_std * y_std,
+            out=np.full_like(numerator, float("nan")),
+            where=(x_std * y_std) != 0,
+        )
+        r2 = corr ** 2
+
+        pad = np.full(n - 1, float("nan"))
+        beta_pad = np.concatenate([pad, beta])
+        r2_pad = np.concatenate([pad, r2])
+        beta_s = pd.Series(beta_pad, index=df.index)
+        r2_s = pd.Series(r2_pad, index=df.index)
+        roll_mean = beta_s.rolling(m, min_periods=min_periods).mean()
+        roll_std = beta_s.rolling(m, min_periods=min_periods).std()
+        z = (beta_s - roll_mean) / roll_std.replace(0, float("nan"))
+        return z * r2_s
+'''
+
+EQUAL_WEIGHT_ENGINE_TEMPLATE = '''"""AlphaQuant 等权持有基准信号引擎（由 vibe_exporter 生成）。
+
+被动对照：全部候选标的等权买入持有，不做任何择时。
+用途：回答「策略的超额是 alpha 还是 beta」——若择时/轮动的跨窗表现
+跑不赢等权持有，则主动策略没有存在价值。
+"""
+
+
+class SignalEngine:
+    EVAL_START = "__EVAL_START__"
+
+    def generate(self, data_map):
+        import pandas as pd
+
+        n = max(len(data_map), 1)
+        out = {}
+        for code, df in data_map.items():
+            weights = pd.Series(1.0 / n, index=df.index, dtype=float)
+            # 评估起点之前强制空仓：与主动策略同一起跑线
+            if self.EVAL_START:
+                cutoff = pd.Timestamp(self.EVAL_START)
+                weights.loc[weights.index < cutoff] = 0.0
+            out[code] = weights
+        return out
+'''
+
+# ----------------------------------------------------------------------
+# 策略注册表：策略名 -> signal_engine 模板
+# 新策略接入：实现一个 AST 沙箱合规模板（无顶层可执行语句/文件 IO/网络）
+# 并在此注册，即可被 backtest --strategy 与 sliding_backtest 使用。
+# 渲染时未出现在模板中的占位符 replace 为无害 no-op。
+# ----------------------------------------------------------------------
+STRATEGY_TEMPLATES: dict[str, str] = {
+    "rsrs_rotation": SIGNAL_ENGINE_TEMPLATE,   # 截面轮动：top_k 等权
+    "rsrs_timing": TIMING_ENGINE_TEMPLATE,     # 单标的滞回择时
+    "equal_weight": EQUAL_WEIGHT_ENGINE_TEMPLATE,  # 被动等权对照
+}
+
+
 # ----------------------------------------------------------------------
 # 导出器主体
 # ----------------------------------------------------------------------
@@ -227,9 +349,18 @@ class VibeBacktestExporter:
         m: int = 600,
         min_periods: int = 60,
         min_score: float = 0.0,
+        strategy: str = "rsrs_rotation",
+        entry_threshold: float = 0.7,   # rsrs_timing 开仓阈值
+        exit_threshold: float = -0.7,   # rsrs_timing 平仓阈值
         commission_rate: float = 0.00025,
         commission_min: float = 5.0,
     ):
+        if strategy not in STRATEGY_TEMPLATES:
+            raise ValueError(
+                f"未知策略 {strategy!r}；可选: {sorted(STRATEGY_TEMPLATES)}")
+        self.strategy = strategy
+        self.entry_threshold = entry_threshold
+        self.exit_threshold = exit_threshold
         self.run_name = run_name
         self.codes = list(codes)
         self.eval_start = eval_start
@@ -340,16 +471,19 @@ class VibeBacktestExporter:
         )
 
         engine_src = (
-            SIGNAL_ENGINE_TEMPLATE
+            STRATEGY_TEMPLATES[self.strategy]
             .replace("__N__", str(self.n))
             .replace("__M__", str(self.m))
             .replace("__MIN_PERIODS__", str(self.min_periods))
             .replace("__TOP_K__", str(self.top_k))
             .replace("__MIN_SCORE__", str(self.min_score))
+            .replace("__ENTRY__", str(self.entry_threshold))
+            .replace("__EXIT__", str(self.exit_threshold))
             .replace('"__EVAL_START__"', repr(str(self.eval_start)))
         )
         (code_dir / "signal_engine.py").write_text(engine_src, encoding="utf-8")
-        logger.success(f"[exporter] run_dir ready: {self.run_dir}")
+        logger.success(f"[exporter] run_dir ready: {self.run_dir} "
+                       f"(strategy={self.strategy})")
         return self.run_dir
 
     # ------------------------------------------------------------------
@@ -390,11 +524,16 @@ class VibeBacktestExporter:
     # 步骤 5：按评估窗口重算指标
     # ------------------------------------------------------------------
     def write_evaluation_metrics(self) -> dict | None:
-        """vibe 的指标按整条净值曲线计算，含 warmup 空仓段，会系统性低估年化。
+        """按 [eval_start, eval_end] 双边裁剪重算窗口指标。
 
-        vibe 0.1.14 不支持 evaluation_start_date，warmup 段只能靠 signal_engine
-        置零来避免交易，但那段零收益仍被计入 total_return / annual_return。
-        这里按 eval_start 切片重算，得到评估窗口的真实表现。
+        两个必须处理的口径问题（实测 2026-08-31 滑动窗口回测中发现）：
+        1. 引擎的回测轴 = 注入帧全长：config 的 start/end_date 只决定
+           loader 缓存 key，**不裁剪净值曲线**——曲线从帧首一直延伸到帧末。
+           若只按 eval_start 裁剪起点，算出的是「窗口起点→帧末」的收益
+           （半年窗口被算成 3.5 年，+187% 的假收益）。
+        2. 引擎内置 benchmark_equity 同样是全帧口径（帧首→帧末），
+           与窗口不可比。这里改用自算基准：窗口内各标的等权买入持有
+           （close 首→末），语义明确且与策略同窗。
         """
         eq_path = self.run_dir / "artifacts" / "equity.csv"
         if not eq_path.exists():
@@ -404,7 +543,8 @@ class VibeBacktestExporter:
         df = pd.read_csv(eq_path, parse_dates=["timestamp"]).set_index("timestamp")
         df = df.sort_index()
         cutoff = pd.Timestamp(self.eval_start)
-        win = df[df.index >= cutoff]
+        end_cutoff = pd.Timestamp(self.eval_end) + pd.Timedelta(days=1)
+        win = df[(df.index >= cutoff) & (df.index < end_cutoff)]
         if win.empty or len(win) < 2:
             logger.warning("[exporter] 评估窗口无数据，跳过指标重算")
             return None
@@ -443,9 +583,11 @@ class VibeBacktestExporter:
             ),
         }
 
-        if "benchmark_equity" in win.columns:
-            bm = win["benchmark_equity"]
-            bm_total = float(bm.iloc[-1] / bm.iloc[0] - 1)
+        # 基准：窗口内等权买入持有（自算；内置 benchmark_equity 为全帧口径，
+        # 与窗口不可比）
+        bm_total = self._equal_weight_benchmark(
+            win.index.min(), win.index.max())
+        if bm_total is not None:
             metrics["benchmark_return"] = bm_total
             metrics["excess_return"] = total - bm_total
 
@@ -459,3 +601,22 @@ class VibeBacktestExporter:
             f"最大回撤 {mdd:.2%}"
         )
         return metrics
+
+    def _equal_weight_benchmark(
+        self, start: pd.Timestamp, end: pd.Timestamp
+    ) -> float | None:
+        """[start, end] 内各标的等权买入持有收益（close 首→末的均值）。"""
+        rets = []
+        for code in self.codes:
+            csv = DATA_DIR / f"{code}.csv"
+            if not csv.exists():
+                continue
+            df = pd.read_csv(csv, parse_dates=["date"]).set_index("date")
+            df = df.sort_index()
+            seg = df[(df.index >= start) & (df.index <= end)]
+            if len(seg) < 2 or seg["close"].iloc[0] <= 0:
+                continue
+            rets.append(float(seg["close"].iloc[-1] / seg["close"].iloc[0] - 1.0))
+        if not rets:
+            return None
+        return sum(rets) / len(rets)

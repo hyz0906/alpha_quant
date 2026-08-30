@@ -74,10 +74,51 @@ python3 main.py calc_factors --codes 512480.SH,513100.SH -n 18 -m 600
 python3 main.py gen_signals  --top-k 2 --fusion
 python3 main.py backtest     --name my_run --codes 512480.SH,513100.SH,588000.SH \
                              --start 2024-01-01 --no-fetch   # 复用现有 csv
+python3 main.py backtest     --name my_run2 --strategy rsrs_timing ...  # 换策略模板
+
+# 滑动窗口回测（多策略 × 多窗口对比，覆盖不同市场周期）
+python3 main.py sliding_backtest --name sliding_20260831 \
+    --start 2023-01-01 --end 2026-06-30 \
+    --window-months 6 --step-months 6 \
+    --strategies rsrs_rotation,rsrs_timing,equal_weight
+# 结果: runs/<name>/summary.md + summary.json + 每窗每策略一个子 run 目录
 
 # QDII 溢价监控（独立）
 python3 main.py monitor
 ```
+
+### 3.2 滑动窗口回测（sliding_backtest）
+
+**动机**：单段回测（如 2024-01~2026-06 全牛市区间）无法区分策略 alpha 与市场 beta。
+把评估期切成若干 6 个月窗口，逐窗跑同一批策略并横向对比，才能看出策略在
+震荡/下跌/上涨不同周期里的稳定性。
+
+**实现**（`src/backtest/sliding_window.py`）：
+
+1. `build_windows` 按自然月切窗（默认 6 个月窗、6 个月步长，可重叠）。
+2. **全局一次性拉数**：先按「首窗起点 − warmup_years(默认3年) ~ 末窗终点」
+   确保三只标的的 csv 齐全（避免每个窗口各自调 broker 覆写同一 csv 反复重拉），
+   已有 csv 首末日期覆盖需求（含 10 天容差，避开元旦等假日首日无 K 线）则跳过。
+3. 逐窗口 × 逐策略实例化 `VibeBacktestExporter` 跑 vibe 回测，
+   读取各自 `evaluation_metrics.json`（窗口口径指标）。
+4. 聚合输出 `runs/<name>/summary.md`（三张表：各窗总收益 / 各窗超额 / 策略聚合）
+   与 `summary.json`（机器可读全量），失败 run 记入 `failed_runs`。
+
+**策略注册表**（`vibe_exporter.STRATEGY_TEMPLATES`，`--strategy` 选择）：
+
+| 策略 | 逻辑 | 角色 |
+|---|---|---|
+| `rsrs_rotation` | 截面轮动：RSRS 修正分 top_k 等权，低于 min_score 空仓 | 主动策略 |
+| `rsrs_timing` | 单标的滞回择时：分 > +0.7 满仓、< −0.7 空仓，区间持有 | 主动策略（少换手） |
+| `equal_weight` | 全部标的等权买入持有 | **被动基准的实盘化** |
+
+`equal_weight` 有两个用途：一是作为「什么都不做」的对照组；二是校验基准口径——
+`write_evaluation_metrics` 自算的 benchmark 就是窗口内等权买入持有，
+所以 equal_weight 的超额应 ≈ 0（实测各窗 ±0.6% 以内，差异来自手续费），
+若显著偏离说明基准或计费出了 bug。
+
+新增策略 = 在 `STRATEGY_TEMPLATES` 里加一个信号引擎模板（vibe AST 沙箱限制：
+只能用白名单语法与 pandas/numpy），无需改其他代码。
 
 ### 3.1 从 Windows 侧驱动 WSL（免切终端）
 
@@ -264,6 +305,41 @@ vibe 子进程（broker、runner）均以 **cwd=$HOME** 运行，此时 `import 
 要判断策略有效性，需换更长的评估窗口、加入熊市样本、并对照等权基准做
 显著性检验（vibe 自带 `monte_carlo_test` / `bootstrap_sharpe_ci` 可用）。
 
+### 7.4 滑动窗口回测（7 窗 × 3 策略，已通过）
+
+`sliding_backtest --name sliding_20260831`（2023-01~2026-06，6 个月窗 × 7 段，
+21/21 run 成功，结果 `runs/sliding_20260831/summary.md`）：
+
+| 窗口 | 区间 | rsrs_rotation | rsrs_timing | equal_weight |
+|---|---|---|---|---|
+| 01 | 2023H1 | +7.17% | +4.88% | +15.53% |
+| 02 | 2023H2 | +1.26% | −5.51% | −5.72% |
+| 03 | 2024H1 | +0.21% | +3.23% | −0.78% |
+| 04 | 2024H2 | +17.61% | +13.70% | +31.29% |
+| 05 | 2025H1 | −12.60% | +0.45% | +4.12% |
+| 06 | 2025H2 | +37.42% | +22.07% | +31.13% |
+| 07 | 2026H1 | +86.66% | +49.68% | +55.79% |
+
+| 策略 | 跨窗复利 | 最差单窗 | 平均夏普 | 最深回撤 | 平均超额 | 超额胜率 |
+|---|---|---|---|---|---|---|
+| rsrs_rotation | +186.74% | −12.60% | 1.04 | −27.34% | +0.92% | 57% |
+| rsrs_timing | +113.49% | −5.51% | 0.99 | −12.22% | −6.12% | 29% |
+| equal_weight | **+201.80%** | −5.72% | **1.23** | −18.74% | +0.01% | 43% |
+
+⚠️ **结论（与 §7.2 互相印证，且更扎心）**：
+1. **被动等权（+201.80%、夏普 1.23）跑赢两个主动策略**——三年半里「什么都不做」
+   是最优解，RSRS 轮动只是在 w07（2026H1）一波大幅反超（+86.66% vs +55.79%），
+   但 w04/w05 又大幅落后，择时版全程负超额（−6.12%、胜率 29%）。
+2. 轮动的价值体现在**回撤与波动 trade-off** 上：最深回撤 −27.34% 确实比
+   equal_weight 的 −18.74% 更差，并没有换来风控优势。
+3. 当前参数下 RSRS 策略**未证明有效**。下一步见 §9。
+
+**本次发现的第 12 个 bug**（已修）：`write_evaluation_metrics` 原本只裁
+`eval_start` 不裁 `eval_end`，而 vibe 的回测轴是注入帧全长（2020→2026），
+导致「窗口收益」实际算成「窗口起点→帧末」（w01 曾报 +187%）。现双边裁剪，
+并自算窗口内等权买入持有基准替代引擎的全帧内置基准（equal_weight 各窗
+超额 ≈0 验证了口径正确）。
+
 ### 7.3 数据正确性核验
 
 引擎实际使用的数据（`runs/<name>/artifacts/ohlcv_*.csv`）与注入的 tencent
@@ -290,12 +366,17 @@ vibe 子进程（broker、runner）均以 **cwd=$HOME** 运行，此时 `import 
 
 ## 9. 策略有效性待办
 
-链路已经跑通，但**策略本身还没被证明有效**（超额仅 +6.20%，见 §7.2）。
-下一步建议：
+链路已经跑通，滑动窗口对照也完成了（§7.4），结论：**两个主动策略都没跑赢
+被动等权**（equal_weight 跨窗复利 +201.80% / 夏普 1.23，为三者最优）。
+下一步建议按优先级：
 
-1. 换更长的评估窗口（含 2018/2022 熊市），看 RSRS 的择时价值是否真实
+1. **调参再判死刑**：当前只是默认参数（top_k=2、min_score=0、日频调仓）。
+   用 `sliding_backtest` 批量扫参——`--min-score 0.5`（空仓过滤）、
+   `--top-k 1`（集中度）、信号降频（周频/月频，需在模板里加重采样）。
+   滑动窗口框架已支持「一次命令对比多组参数」。
 2. 用 vibe 自带的 `monte_carlo_test` / `bootstrap_sharpe_ci` /
    `walk_forward_analysis` 做显著性检验，排除运气成分
-3. 调参方向：降低调仓频率（日频 → 周频/月频，减少换手损耗）、
-   `--min-score` 设正值做空仓过滤、`--top-k 1` 提高集中度
-4. 扩大候选池（当前只有 3 个 ETF，截面轮动的选择空间太窄）
+3. 扩大候选池（当前只有 3 个 ETF，截面轮动选择空间太窄；
+   STRATEGY_PLAN.md §4 有候选池扩展设计）
+4. 数据起点前推到 2018（含 2018 熊市与 2022 下跌），
+   当前窗口最早只到 2023，样本全是结构性牛市

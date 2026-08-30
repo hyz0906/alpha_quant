@@ -170,10 +170,40 @@ def cmd_backtest(args):
         n=args.n,
         m=args.m,
         min_score=args.min_score,
+        strategy=args.strategy,
     )
     rc = exporter.run(ensure_data_first=not args.no_fetch)
     if rc == 0:
         logger.success(f"回测完成，结果见 runs/{args.name}/")
+
+
+# ----------------------------------------------------------------------
+# 4b. 滑动窗口多策略回测
+# ----------------------------------------------------------------------
+def cmd_sliding_backtest(args):
+    from src.backtest.sliding_window import SlidingWindowRunner
+
+    codes = parse_codes(args.codes)
+    strategies = [s.strip() for s in args.strategies.split(",") if s.strip()]
+    runner = SlidingWindowRunner(
+        codes=codes,
+        start=args.start,
+        end=args.end,
+        window_months=args.window_months,
+        step_months=args.step_months,
+        strategies=strategies,
+        run_base=args.name,
+        initial_cash=args.cash,
+        top_k=args.top_k,
+        n=args.n,
+        m=args.m,
+        min_score=args.min_score,
+        warmup_years=args.warmup_years,
+        fetch_start=args.start_fetch,
+        allow_partial=args.allow_partial,
+    )
+    runner.run()
+    logger.success(f"滑动窗口回测完成：runs/{args.name}/summary.md")
 
 
 # ----------------------------------------------------------------------
@@ -288,12 +318,14 @@ def main():
                    help="附加单标的 RSRS+情感融合信号")
     p.set_defaults(func=cmd_gen_signals)
 
-    p = sub.add_parser("backtest", help="vibe ChinaAEngine 回测 RSRS 轮动")
+    p = sub.add_parser("backtest", help="vibe ChinaAEngine 回测(单窗口)")
     p.add_argument("--name", default=f"rsrs_rotation_{date.today():%Y%m%d}")
     p.add_argument("--codes", default="512480.SH,513100.SH,588000.SH")
     p.add_argument("--start", default="2024-01-01", help="评估起点")
     p.add_argument("--end", default=str(date.fromordinal(date.today().toordinal() - 1)),
                    help="评估终点(须早于今天)")
+    p.add_argument("--strategy", default="rsrs_rotation",
+                   help="rsrs_rotation / rsrs_timing / equal_weight")
     p.add_argument("--cash", type=float, default=100_000.0)
     p.add_argument("--top-k", dest="top_k", type=int, default=2)
     p.add_argument("--min-score", dest="min_score", type=float, default=0.0)
@@ -301,6 +333,33 @@ def main():
     for a, kw in rsrs_window_args:
         p.add_argument(*a, **kw)
     p.set_defaults(func=cmd_backtest)
+
+    p = sub.add_parser(
+        "sliding_backtest",
+        help="半年滑动窗口多策略回测(rotation/timing/equal_weight)")
+    p.add_argument("--codes", default="512480.SH,513100.SH,588000.SH")
+    p.add_argument("--start", default="2023-01-01",
+                   help="首个评估窗口起点(默认保证 M=600 warmup)")
+    p.add_argument("--end", default="2026-06-30", help="末窗截止日")
+    p.add_argument("--window-months", dest="window_months", type=int,
+                   default=6, help="窗口长度(月)")
+    p.add_argument("--step-months", dest="step_months", type=int,
+                   default=None, help="滑动步长(月)；默认=窗口长，即不重叠")
+    p.add_argument("--strategies",
+                   default="rsrs_rotation,rsrs_timing,equal_weight",
+                   help="逗号分隔，见 vibe_exporter.STRATEGY_TEMPLATES")
+    p.add_argument("--name", default=f"sliding_{date.today():%Y%m%d}")
+    p.add_argument("--cash", type=float, default=100_000.0)
+    p.add_argument("--top-k", dest="top_k", type=int, default=2)
+    p.add_argument("--min-score", dest="min_score", type=float, default=0.0)
+    p.add_argument("--start-fetch", dest="start_fetch", default=None,
+                   help="数据起点；默认=首窗起点往前 warmup-years 年")
+    p.add_argument("--warmup-years", dest="warmup_years", type=int, default=3)
+    p.add_argument("--allow-partial", dest="allow_partial",
+                   action="store_true", help="允许末尾不足整窗的部分窗口")
+    for a, kw in rsrs_window_args:
+        p.add_argument(*a, **kw)
+    p.set_defaults(func=cmd_sliding_backtest)
 
     p = sub.add_parser("run_all", help="fetch->factors->signals->backtest 一条龙")
     p.add_argument("--codes", default="512480.SH,513100.SH,588000.SH")
