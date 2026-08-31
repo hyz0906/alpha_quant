@@ -9,6 +9,10 @@
       月频完整历史（2005 至今约 250 个月，非「近 1 年」），仅覆盖少数宽基
       （沪深300/中证500/上证50）。—— 用于全历史估值分位 + 时序估值择时。
   * 债券收益率 `bond_zh_us_rate()`：中国 10 年期国债收益率，作债券 carry 参考。
+  * 蛋卷基金指数估值列表 `fetch_danjuan_index_valuation()`：
+      63 个指数（含跨境：纳指100/标普500/恒生/德国DAX 等）的单截面估值快照，
+      自带 pe/pb 历史分位（0~1）。免登录公开接口，比中证官网 xls 覆盖广得多。
+      —— 用于「63 指数截面估值排名」，判断当前谁便宜谁贵（单截面，非历史面板）。
 
 ⚠️ 已知局限（重要）：
   * 免费 akshare 无「多年点-in-time 指数 PE/PB/股息率历史」，无法支撑标准
@@ -141,6 +145,55 @@ def fetch_valuation_snapshot() -> pd.DataFrame:
             except Exception:
                 pass
         rows.append(rec)
+    return pd.DataFrame(rows)
+
+
+# --------------------------------------------------------------------------- #
+# 蛋卷基金指数估值列表（63 指数，免登录单截面快照）——截面估值排名用
+# --------------------------------------------------------------------------- #
+# 实测（2026-08-31）：GET https://danjuanapp.com/djapi/index_eva/dj 免登录直接返回
+# 63 个指数的当前估值。字段：index_code(带SH/SZ前缀)、name、pe、pb、pe_percentile、
+# pb_percentile、roe、yeild(股息率，注意拼写)、begin_at(数据起点)、eva_type("low"
+# =低估)。pe/pb 为 TTM 值，0 表示该指数无此指标（如亏损行业）。percentile 为 0~1
+# （越低越便宜）。历史序列接口 /history 需登录（返回"请重新登录"），故仅单截面可用。
+DANJUAN_INDEX_EVA_URL = "https://danjuanapp.com/djapi/index_eva/dj"
+
+
+def fetch_danjuan_index_valuation() -> pd.DataFrame:
+    """蛋卷基金指数估值列表（63 指数，免登录单截面快照）。
+
+    比中证官网 xls（20 日 + 6 A 股）覆盖更广：63 指数含跨境（纳指100/标普500/
+    恒生/德国DAX 等），且自带 pe/pb 历史分位（0~1，越低越便宜）。
+
+    返回 DataFrame，列：
+      index_code(带SH/SZ前缀) name pe pb pe_percentile pb_percentile
+      roe dividend_yield begin_at date eva_type
+    pe/pb 为 TTM 值，0 表示该指数无此指标；percentile 为 0~1 的历史分位。
+    """
+    import json
+    import urllib.request
+    req = urllib.request.Request(
+        DANJUAN_INDEX_EVA_URL,
+        headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                 "Referer": "https://danjuanapp.com/"})
+    txt = urllib.request.urlopen(req, timeout=20).read().decode("utf-8", "ignore")
+    j = json.loads(txt)
+    items = j["data"]["items"]
+    rows = []
+    for it in items:
+        rows.append({
+            "index_code": it["index_code"],
+            "name": it["name"],
+            "pe": float(it.get("pe") or 0.0),
+            "pb": float(it.get("pb") or 0.0),
+            "pe_percentile": float(it.get("pe_percentile") or 0.0),
+            "pb_percentile": float(it.get("pb_percentile") or 0.0),
+            "roe": float(it.get("roe") or 0.0),
+            "dividend_yield": float(it.get("yeild") or 0.0),  # 注意接口拼写 yeild
+            "begin_at": pd.to_datetime(it.get("begin_at"), unit="ms") if it.get("begin_at") else pd.NaT,
+            "date": it.get("date"),
+            "eva_type": it.get("eva_type"),
+        })
     return pd.DataFrame(rows)
 
 
