@@ -31,10 +31,25 @@ from src.strategies.factors.factor_library import (
 ROOT = Path("/home/hyz0906/workspace/alpha_quant")
 DATA_DIR = ROOT / "data"
 
-CODES = [
+# 默认池：扩展池 12 只（同质权益为主，§7.10 全灭的基准）
+DEFAULT_CODES = [
     "510300.SH", "510500.SH", "159915.SZ", "512010.SH", "159928.SZ",
     "512880.SH", "512660.SH", "512400.SH", "513100.SH", "513500.SH",
     "513050.SH", "518880.SH",
+]
+
+# 异构池：跨资产/跨市场（A股宽基+行业+债券+商品+跨境）
+HETERO_CODES = [
+    # A股宽基
+    "510300.SH", "510500.SH", "159915.SZ",
+    # A股行业
+    "512010.SH", "159928.SZ", "512880.SH", "512660.SH",
+    # 债券
+    "511010.SH", "511180.SH",
+    # 商品
+    "518880.SH", "159985.SZ", "159981.SZ",
+    # 跨境权益（不同区域）
+    "513100.SH", "513500.SH", "513050.SH", "513880.SH", "513030.SH", "159920.SZ",
 ]
 N_QUANTILES = 5
 STRONG_ICIR = 0.5
@@ -114,23 +129,54 @@ def verdict(icir: float, pos_rate: float) -> str:
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--horizons", default="5,10,20")
+    ap.add_argument("--pool", choices=["default", "hetero"], default="default",
+                    help="default=扩展池12只；hetero=跨资产/跨市场18只")
+    ap.add_argument("--codes", nargs="*", default=None,
+                    help="自定义标的列表（覆盖 --pool），如 510300.SH 511010.SH ...")
+    ap.add_argument("--start", default=None, help="仅用该日期之后的样本（YYYY-MM-DD）")
+    ap.add_argument("--end", default=None, help="仅用该日期之前的样本（YYYY-MM-DD）")
     args = ap.parse_args()
     horizons = [int(x) for x in args.horizons.split(",")]
 
+    if args.codes:
+        codes = args.codes
+    elif args.pool == "hetero":
+        codes = HETERO_CODES
+    else:
+        codes = DEFAULT_CODES
+
     # ---- 1. 读数据 → 面板 ----
     closes, highs, lows, volumes = {}, {}, {}, {}
-    for code in CODES:
-        df = pd.read_csv(DATA_DIR / f"{code}.csv", parse_dates=["date"]).set_index("date")
+    missing = []
+    for code in codes:
+        path = DATA_DIR / f"{code}.csv"
+        if not path.exists():
+            missing.append(code)
+            continue
+        df = pd.read_csv(path, parse_dates=["date"]).set_index("date")
         df = df.sort_index()
         closes[code] = df["close"]
         highs[code] = df["high"]
         lows[code] = df["low"]
         volumes[code] = df["volume"]
+    if missing:
+        print(f"⚠️ 缺少数据文件，已跳过: {missing}")
 
     close = pd.DataFrame(closes).sort_index()
     high = pd.DataFrame(highs).sort_index()
     low = pd.DataFrame(lows).sort_index()
     volume = pd.DataFrame(volumes).sort_index()
+
+    if args.start:
+        close = close[close.index >= pd.Timestamp(args.start)]
+        high = high[high.index >= pd.Timestamp(args.start)]
+        low = low[low.index >= pd.Timestamp(args.start)]
+        volume = volume[volume.index >= pd.Timestamp(args.start)]
+    if args.end:
+        close = close[close.index <= pd.Timestamp(args.end)]
+        high = high[high.index <= pd.Timestamp(args.end)]
+        low = low[low.index <= pd.Timestamp(args.end)]
+        volume = volume[volume.index <= pd.Timestamp(args.end)]
 
     panels = build_panels(close, high, low, volume)
     factors = compute_all_factors(panels)
@@ -174,7 +220,7 @@ def main():
     order = sorted(results, key=lambda n: -abs(results[n]["best_icir"]))
 
     print("=" * 100)
-    print("多因子筛选诊断：截面 IC / ICIR / 分层收益（扩展池 12 只，2017-09 起）")
+    print(f"多因子筛选诊断：截面 IC / ICIR / 分层收益（{args.pool if not args.codes else 'custom'} 池 {len(codes)} 只）")
     print("=" * 100)
     header = (f"{'因子':<16} {'判定':<7} {'bestH':>5} {'bestICIR':>9} "
               + " ".join([f"{'IC'+str(k):>9}" for k in horizons])
@@ -218,20 +264,25 @@ def main():
         print("  无 |corr|>0.5 的高相关因子对")
 
     # ---- 7. 落盘 JSON + Markdown ----
+    tag = args.pool if not args.codes else "custom"
+    if args.start:
+        tag += f"_from{args.start}"
+    json_path = ROOT / f"runs/factor_screening_{tag}.json"
+    md_path = ROOT / f"runs/factor_screening_{tag}.md"
     out = {
-        "codes": CODES,
+        "pool": tag,
+        "codes": codes,
         "horizons": horizons,
         "thresholds": {"strong_icir": STRONG_ICIR, "weak_icir": WEAK_ICIR,
                        "pos_rate_band": list(POS_RATE_BAND)},
         "results": results,
         "factor_correlation": corr.round(3).to_dict(),
     }
-    (ROOT / "runs/factor_screening.json").write_text(
-        json.dumps(out, ensure_ascii=False, indent=2), encoding="utf-8"
-    )
+    json_path.write_text(json.dumps(out, ensure_ascii=False, indent=2), encoding="utf-8")
 
+    n_codes = len(codes)
     md_lines = [
-        "# 多因子筛选诊断报告（扩展池 12 只，2017-09 起）\n",
+        f"# 多因子筛选诊断报告（{tag} 池 {n_codes} 只）\n",
         f"> 判定门槛：强通过 |ICIR|≥{STRONG_ICIR}、弱通过 |ICIR|≥{WEAK_ICIR}，"
         f"且正 IC 占比须落在 {POS_RATE_BAND[0]:.0%}~{POS_RATE_BAND[1]:.0%} 之外。\n",
         "## 1. 因子排名（按 best |ICIR| 降序）\n",
@@ -272,16 +323,15 @@ def main():
         md_lines.append("- 无")
 
     md_lines += ["\n## 4. 结论与注意事项\n",
-                 "- 截面仅 12 只标的，单日 IC 噪声大；ICIR 用「日频 IC 均值/标准差」"
+                 f"- 截面 {n_codes} 只标的，单日 IC 噪声大；ICIR 用「日频 IC 均值/标准差」"
                  "近似，相邻日 IC 因重叠前视收益而高度自相关，正式显著性需 Newey-West。",
-                 "- 16 因子 × 3 视界 ≈ 48 次检验，5% 显著性下约 2.4 个假阳性，"
+                 f"- {len(results)} 因子 × {len(horizons)} 视界 ≈ {len(results)*len(horizons)} 次检验，"
+                 f"5% 显著性下约 {len(results)*len(horizons)*0.05:.0f} 个假阳性，"
                  "凡通过的因子须在下一轮轮动回测中复现，不可直接采信。",
                  "- RSRS（rsrs_zscore）此前诊断 ICIR≈-0.03，为对照下限。\n"]
-    (ROOT / "runs/factor_screening_20260831.md").write_text(
-        "\n".join(md_lines), encoding="utf-8"
-    )
-    print(f"\nJSON 已写入: runs/factor_screening.json")
-    print(f"Markdown 已写入: runs/factor_screening_20260831.md")
+    md_path.write_text("\n".join(md_lines), encoding="utf-8")
+    print(f"\nJSON 已写入: {json_path.name}")
+    print(f"Markdown 已写入: {md_path.name}")
 
 
 if __name__ == "__main__":
