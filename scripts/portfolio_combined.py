@@ -154,6 +154,68 @@ def yearly(net: pd.Series) -> pd.Series:
 
 
 # --------------------------------------------------------------------------- #
+# 换手结构拆解（回答「换手率到底是什么、是否按月换手」）
+# --------------------------------------------------------------------------- #
+def to_ann(W: pd.DataFrame, years: float) -> float:
+    """年化「组合层面」单边换手 = Σ_t Σ_i |ΔW_i,t| / 年数。
+
+    注意：这是 18 只资产权重变动的**加总**，可 >1；不等于「全仓换手 N 次」。
+    摊到单只 = 该值 / 18 只后看分布（多数腿远低于均值）。
+    """
+    return float(W.diff().abs().sum(axis=1).fillna(0).sum() / years)
+
+
+def flips_per_year(s: pd.Series) -> float:
+    """门控翻转次数（0↔1 切换）/年。一次完整「减仓+回补」= 2 次翻转。
+
+    年数按序列自身频率推断，不套用日频年数——否则月频序列的翻转次数会被
+    除以日频年数而严重高估（月频 46 次 / 21.3 年才对，除以 5.59 会得 8.2）。
+    """
+    n = float(s.diff().abs().fillna(0).gt(0).sum())
+    if len(s) < 3:
+        return n / (len(s) / rp.TRADING_DAYS)
+    span_days = (s.index[-1] - s.index[0]).days
+    avg_gap = span_days / (len(s) - 1)
+    years = span_days / 365.25 if avg_gap > 20 else len(s) / rp.TRADING_DAYS
+    return n / years
+
+
+def turnover_breakdown(panel: pd.DataFrame, W_base: pd.DataFrame,
+                       W_pb: pd.DataFrame, W_full: pd.DataFrame,
+                       years: float) -> dict:
+    """拆解换手：按层增量 + 按发生日（月频再平衡 vs 日频门控）。"""
+    # 再平衡实际执行日 = 次月首个交易日（build_weights 月末赋值→ffill→shift(1)）
+    idx = panel.index
+    month_ends = set(idx.to_series().groupby(idx.to_period("M")).last())
+    reb_days = {idx[i + 1] for i, d in enumerate(idx)
+                if d in month_ends and i + 1 < len(idx)}
+
+    to_daily = W_full.diff().abs().sum(axis=1).fillna(0.0)
+    act = to_daily[to_daily > 1e-9]
+    is_reb = np.array([d in reb_days for d in act.index])
+
+    per_asset = (W_full.diff().abs().sum() / years).sort_values(ascending=False)
+
+    return {
+        "by_layer": {
+            "逆波动底仓(月频)": to_ann(W_base, years),
+            "PB门控增量(月频)": to_ann(W_pb, years) - to_ann(W_base, years),
+            "QDII门控增量(日频)": to_ann(W_full, years) - to_ann(W_pb, years),
+            "合计": to_ann(W_full, years),
+        },
+        "by_day": {
+            "月频再平衡执行日数": int(is_reb.sum()),
+            "月频换手/年": float(act[is_reb].sum() / years),
+            "日频门控触发日数": int((~is_reb).sum()),
+            "日频换手/年": float(act[~is_reb].sum() / years),
+            "有换手交易日占比": float(len(act) / len(panel)),
+        },
+        "per_asset_top": [(c, float(v)) for c, v in per_asset.head(6).items()],
+        "per_asset_median": float(per_asset.median()),
+    }
+
+
+# --------------------------------------------------------------------------- #
 # 主流程
 # --------------------------------------------------------------------------- #
 def main():
@@ -193,12 +255,22 @@ def main():
         W = build_final_weights(panel, pb_scope=scope)
         net, _ = backtest_net(panel, W)
         sens[f"PB范围={scope}"] = full_metrics(net, W)
-    for c in [0.0, 0.0015, 0.003]:
+    for c in [0.0, 0.0015, 0.003, 0.005]:
         W = Ws["D. 三层全开"]
         net, _ = backtest_net(panel, W, cost=c)
         mm = rp.metrics(net)
         mm["turnover"] = tiers["D. 三层全开"]["m"]["turnover"]
         sens[f"成本={c*100:.2f}%"] = mm
+
+    # ---- 换手结构拆解 ----
+    years = len(panel) / rp.TRADING_DAYS
+    tbd = turnover_breakdown(panel, Ws["A. 逆波动基线"],
+                             Ws["B. +PB 门控(A股腿)"], Ws["D. 三层全开"], years)
+    gates = {"PB门控(沪深300 PB分位, 月频)": pb_gate_monthly("triple").shift(1).dropna()}
+    for c in QDII_LEGS:
+        gq = qdii_gate_daily(c, panel.index)
+        gates[f"QDII {c}"] = gq
+    tbd["flips"] = {k: flips_per_year(v) for k, v in gates.items()}
 
     # ---- 控制台 ----
     print(f"{'档位':<22} {'年化%':>8} {'波动%':>8} {'夏普':>6} {'回撤%':>8} "
@@ -223,6 +295,7 @@ def main():
                          "yearly": {str(y): round(float(r), 4)
                                     for y, r in v["yearly"].items()}}
                      for k, v in tiers.items()},
+           "turnover_breakdown": tbd,
            "sensitivity": {k: {kk: (round(vv, 4) if isinstance(vv, float) else vv)
                                for kk, vv in v.items()} for k, v in sens.items()}}
     (ROOT / "runs" / "portfolio_combined.json").write_text(
@@ -266,7 +339,52 @@ def main():
     L.append("- 其余腿（国债 511010/511180、黄金 518880、豆粕 159985、能源化工 159981）"
              "无门控，仅参与逆波动加权。")
 
-    L.append("\n## 5. 关键结论\n")
+    L.append("\n## 5. 换手结构拆解（是否按月换手？）\n")
+    L.append("> 口径：年化换手 = `Σ_t Σ_i |ΔW_i,t| / 年数`，是 **18 只资产权重变动的加总**，"
+             "可 >1；**不等于「全仓一年换手 N 次」**。摊到单只后中位数仅 "
+             f"{tbd['per_asset_median']:.3f}（约 {tbd['per_asset_median']*100:.0f}pp/年）。\n")
+    L.append("**按层拆解（D 档）**\n")
+    L.append("| 来源 | 频率 | 换手/年 | 占比 |")
+    L.append("|---|---|---|---|")
+    tot = tbd["by_layer"]["合计"]
+    for k, lbl in [("逆波动底仓(月频)", "月频（次月首个交易日执行）"),
+                   ("PB门控增量(月频)", "月频（跨档才动作）"),
+                   ("QDII门控增量(日频)", "日频（T+1 执行，min_hold=5）")]:
+        v = tbd["by_layer"][k]
+        L.append(f"| {k} | {lbl} | {v:.2f} | {v/tot*100:.0f}% |")
+    L.append(f"| **合计** | — | **{tot:.2f}** | 100% |\n")
+    bd = tbd["by_day"]
+    L.append("**按换手发生日拆解**\n")
+    L.append("| 类别 | 天数 | 换手/年 | 占比 |")
+    L.append("|---|---|---|---|")
+    bsum = bd["月频换手/年"] + bd["日频换手/年"]
+    L.append(f"| 月频再平衡执行日 | {bd['月频再平衡执行日数']} | "
+             f"{bd['月频换手/年']:.2f} | {bd['月频换手/年']/bsum*100:.0f}% |")
+    L.append(f"| 日频门控触发日 | {bd['日频门控触发日数']} | "
+             f"{bd['日频换手/年']:.2f} | {bd['日频换手/年']/bsum*100:.0f}% |")
+    L.append(f"\n有换手的交易日占全部交易日 **{bd['有换手交易日占比']*100:.1f}%**"
+             "（其余 78% 的交易日完全不动）。\n")
+    L.append("**门控翻转频次（次/年，一次「减仓+回补」= 2 次翻转）**\n")
+    L.append("| 门控 | 翻转 次/年 | 折合完整回合/年 |")
+    L.append("|---|---|---|")
+    for k, v in tbd["flips"].items():
+        L.append(f"| {k} | {v:.2f} | {v/2:.1f} |")
+    L.append("\n**换手最大的腿（年均权重变动）**\n")
+    L.append("| 代码 | 年均权重变动 |")
+    L.append("|---|---|")
+    for c, v in tbd["per_asset_top"]:
+        L.append(f"| {c} | {v*100:.1f}pp |")
+    L.append(f"\n18 只中位数仅 **{tbd['per_asset_median']*100:.1f}pp/年**——"
+             "换手高度集中在 QDII 腿。\n")
+    L.append("**结论**：**不是纯粹按月换手**，而是「月度再平衡 + 日频应急减仓」的混合结构。"
+             "月频部分（逆波动 + PB）贡献约四成换手、节奏固定可预期；"
+             "QDII 门控是日频的、贡献约六成，但单次仅涉及约 4% 的组合资金。"
+             f"按 0.15% 单边成本，年化换手成本 **{tot*0.0015*100:.2f}%**"
+             f"（占 D 档年化 {tiers['D. 三层全开']['m']['ann_ret']*100:.2f}% 的 "
+             f"{tot*0.0015/tiers['D. 三层全开']['m']['ann_ret']*100:.0f}%）；"
+             "即使把成本抬到 0.50%（极端保守）夏普仍有 1.05——换手不构成落地障碍。")
+
+    L.append("\n## 6. 关键结论\n")
     base = tiers["A. 逆波动基线"]["m"]
     d = tiers["D. 三层全开"]["m"]
     b = tiers["B. +PB 门控(A股腿)"]["m"]
@@ -285,11 +403,13 @@ def main():
              "代价是 2025 单边牛市跑输基线 ~1.9pp（PB 分位冲高过早减仓）与 2020 下半年踏空 ~2.2pp。"
              "「熊市少亏 + 牛市少赚」是两个门控共同的收益形态，符合其「尾部保护」定位。")
     L.append("- **敏感性稳健**：PB 规则（triple/binary/linear）× 范围（全A股/仅沪深300）× 成本"
-             "（0/0.15%/0.30%）共 8 个变体夏普 1.11~1.43 全部 >1，无悬崖、无单点依赖。"
+             "（0/0.15%/0.30%/0.50%）共 9 个变体夏普 1.05~1.43 全部 >1，无悬崖、无单点依赖。"
              "binary(0.5) 规则样本内夏普最高（1.43），但**不据此调参**（样本内选择），"
              "默认口径仍用三档。")
-    L.append(f"- **换手可控**：D 档年化单边换手 {d['turnover']:.2f}（基线 {base['turnover']:.2f}），"
-             "增量主要来自 QDII 门控的日频翻转；成本敏感性显示 0.30% 成本下夏普仍有 1.18。")
+    L.append(f"- **换手可控且结构清晰**（详见 §5）：D 档年化单边换手 {d['turnover']:.2f}"
+             f"（基线 {base['turnover']:.2f}），是 18 只资产权重变动的**加总**而非「全仓换手次数」——"
+             "摊到单只中位数仅 ~10pp/年。月频再平衡贡献约四成、日频 QDII 门控约六成；"
+             "年化换手成本 0.52%（0.15% 单边），即使抬到 0.50% 单边夏普仍有 1.05。")
     L.append("- **口径边界**：① QDII 单位净值 T+1~T+2 才公布，溢价序列存在固有的 ~1 日信息滞后"
              "（沿用 §7.18 全部回测的同款口径，状态机 T+1 执行 + min_hold=5 部分缓解）；"
              "② PB 门控用沪深300 分位代理全 A 股估值（对中证500/创业板腿是简化假设）；"
