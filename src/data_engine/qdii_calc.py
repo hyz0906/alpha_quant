@@ -36,6 +36,10 @@ warnings.filterwarnings("ignore")
 # 溢价告警阈值（绝对值，%）
 ALERT_THRESHOLD = 3.0
 
+# 溢价「相对变化」告警参数：滚动窗口（交易日）与 z 分数阈值
+RELCHANGE_WINDOW = 60
+RELCHANGE_Z = 2.0
+
 # 池内 QDII ETF -> 底层市场（用于影子 IOPV 调整）
 # 字段：us=美股新浪指数 / hk=港股东财指数 / global=新浪全球指数(DAX/日经) / fx=汇率币种
 QDII_UNDERLYING: dict[str, dict] = {
@@ -46,6 +50,24 @@ QDII_UNDERLYING: dict[str, dict] = {
     "159920.SZ": {"market": "港股", "hk": "HSI",   "fx": "港币", "label": "恒生指数"},
     "513880.SH": {"market": "日本", "global": "日经225指数", "fx": "日元", "label": "日经225"},
 }
+
+
+def relchange_zscore(premium: pd.Series, window: int = RELCHANGE_WINDOW) -> pd.Series:
+    """溢价「相对变化」信号：一阶差分的滚动 z 分数。
+
+    核心思想（§7.18 E）：2024 起 QDII 额度告罄使绝对溢价结构性抬升（纳指 2026
+    全年 94% 时间溢价>3%），绝对阈值失去判别力；但「溢价的异常变动」仍含信息——
+    飙升(z>+2)=额度骤紧/抢购（危险），回落(z<-2)=底层大涨、场内价滞后（买点）。
+
+    实现：dprem = premium.diff()；z_t = (dprem_t - mean_{t-W..t-1}) / std_{t-W..t-1}。
+    滚动均值/标准差滞后 1 期（shift(1)），既避免当前点自参考、也无前视。
+    """
+    d = premium.diff()
+    minp = max(20, window // 3)
+    mu = d.rolling(window, min_periods=minp).mean().shift(1)
+    sd = d.rolling(window, min_periods=minp).std().shift(1)
+    z = (d - mu) / sd
+    return z
 
 
 class QDIICalculator:
