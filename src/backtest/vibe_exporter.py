@@ -233,6 +233,24 @@ WEEKLY_ENGINE_TEMPLATE = SIGNAL_ENGINE_TEMPLATE.replace(
 )
 assert WEEKLY_ENGINE_TEMPLATE != SIGNAL_ENGINE_TEMPLATE
 
+# 月频轮动：由周频模板再派生——仅把「周频化」的 to_period("W") 换成
+# to_period("M")，其余（RSRS 核心 + EVAL_START 置零）完全一致。锚点串若随
+# 周频模板改动失效，下面的 assert 会在 import 时立刻暴露。
+_MONTHLY_ANCHOR = '        period = weights.index.to_period("W")'
+assert WEEKLY_ENGINE_TEMPLATE.count(_MONTHLY_ANCHOR) == 1, \
+    "月频模板锚点在周频模板中不唯一，派生失败"
+MONTHLY_ENGINE_TEMPLATE = WEEKLY_ENGINE_TEMPLATE.replace(
+    'AlphaQuant RSRS 周频轮动信号引擎',
+    'AlphaQuant RSRS 月频轮动信号引擎',
+).replace(
+    '        # 周频化：每周首个交易日才调仓，目标权重持有整周',
+    '        # 月频化：每月首个交易日才调仓，目标权重持有整月',
+).replace(
+    _MONTHLY_ANCHOR,
+    '        period = weights.index.to_period("M")',
+)
+assert MONTHLY_ENGINE_TEMPLATE != WEEKLY_ENGINE_TEMPLATE
+
 
 TIMING_ENGINE_TEMPLATE = '''"""AlphaQuant RSRS 择时信号引擎（由 vibe_exporter 生成）。
 
@@ -352,6 +370,7 @@ class SignalEngine:
 STRATEGY_TEMPLATES: dict[str, str] = {
     "rsrs_rotation": SIGNAL_ENGINE_TEMPLATE,   # 截面轮动：top_k 等权，日频调仓
     "rsrs_rotation_weekly": WEEKLY_ENGINE_TEMPLATE,  # 同上，周频调仓
+    "rsrs_rotation_monthly": MONTHLY_ENGINE_TEMPLATE,  # 同上，月频调仓（降换手）
     "rsrs_timing": TIMING_ENGINE_TEMPLATE,     # 单标的滞回择时
     "equal_weight": EQUAL_WEIGHT_ENGINE_TEMPLATE,  # 被动等权对照
 }
