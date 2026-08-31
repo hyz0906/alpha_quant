@@ -6,11 +6,11 @@
 carry/value 诊断。
 
 诚实边界（重要）：
-  * 免费 akshare 无「多年点-in-time 指数估值历史」，只能拿到：
-      - 中证指数官方估值快照（最新约 20 日 PE + 股息率）—— 单截面
-      - 乐咕乐股近 1 年日频 PE/PB —— 短窗分位
-    因此本脚本做的是「截面估值/股息率排名 + 股债性价比」，而非标准 IC 时间序列
-    检验（后者需 Tushare Pro 指数估值历史或中证官网历史导出）。
+  * 免费源可得的估值数据分两类：
+      - 中证指数官方估值快照（最新约 20 日 PE + 股息率）—— 单截面，可覆盖 6 只行业/宽基 ETF
+      - 乐咕乐股月频完整历史（2005 至今）—— 但仅覆盖 3 个宽基（上证50/沪深300/中证500）
+    因此本脚本做「截面估值/股息率排名 + 股债性价比」，全历史分位仅对沪深300/中证500 可得。
+    标准截面 IC 时间序列检验需「多年 × 多标的」估值面板（Tushare index_dailybasic，需 2000 积分）。
   * 债券/商品/跨境 ETF 无 PE 概念，仅标注替代 carry 口径，不参与权益估值排名。
 
 用法：python3 scripts/fundamental_screening.py
@@ -69,7 +69,7 @@ def main():
     L.append("> **局限**：免费源无多年点-in-time 估值历史，本报告为单截面快照，非 IC 时间序列。\n")
 
     L.append("## 1. A 股权益 ETF 估值与 carry 快照\n")
-    L.append("| ETF | 指数 | PE(TTM) | 静态PE | 股息率% | 盈利收益率% | PE分位(1y) | PB分位(1y) | 10Y国债 | ERP% |")
+    L.append("| ETF | 指数 | PE(TTM) | 静态PE | 股息率% | 盈利收益率% | PE分位(全史) | PB分位(全史) | 10Y国债 | ERP% |")
     L.append("|---|---|---|---|---|---|---|---|---|---|")
     for _, r in snap.iterrows():
         def fmt(x, n=2):
@@ -77,8 +77,8 @@ def main():
         L.append(
             f"| {r['etf']} | {r['index']} | {fmt(r['pe'])} | {fmt(r['pe_static'])} "
             f"| {fmt(r['dividend_yield'])} | {fmt(r['earnings_yield'])} "
-            f"| {fmt(r['pe_pct_1y']*100 if pd.notna(r['pe_pct_1y']) else None, 0)}% "
-            f"| {fmt(r['pb_pct_1y']*100 if pd.notna(r['pb_pct_1y']) else None, 0)}% "
+            f"| {fmt(r['pe_pct_hist']*100 if pd.notna(r['pe_pct_hist']) else None, 0)}% "
+            f"| {fmt(r['pb_pct_hist']*100 if pd.notna(r['pb_pct_hist']) else None, 0)}% "
             f"| {fmt(r10y) if r10y else '—'} | {fmt(r['erp'])} |"
         )
 
@@ -107,9 +107,9 @@ def main():
 
     L.append("\n## 5. 数据覆盖与局限\n")
     L.append("- **已覆盖**：7 只 A 股权益 ETF 中 6 只有中证指数官方 PE + 股息率（创业板 399006 因中证官网 404 缺失，待走深证/国证官网或乐咕）。")
-    L.append("- **短窗分位**：仅沪深300/中证500 拿到乐咕 1 年 PE/PB 分位，其余宽基以下指数乐咕不覆盖。")
-    L.append("- **无法做 IC 时间序列检验**：截面 Spearman IC 需要「多年点-in-time 因子 × 未来收益」面板，免费源只有快照 + 1 年短窗。")
-    L.append("- **补全路径**：Tushare Pro（`index_dailybasic` 指数估值日频历史，需 token）或中证指数官网历史导出（`csindex.com.cn` 估值页）。这是下一项数据接入任务。")
+    L.append("- **全历史分位**：仅沪深300/中证500 拿到乐咕月频完整历史（2005 至今）PE/PB 分位，其余宽基以下指数乐咕不覆盖。")
+    L.append("- **无法做多标的截面 IC 检验**：截面 Spearman IC 需要「多年 × 多标的 点-in-time 因子 × 未来收益」面板，免费源只有「20 日快照 × 6 行业」+「月频多年 × 3 宽基」，无法支撑标准截面 IC。")
+    L.append("- **补全路径**：Tushare Pro `index_dailybasic`（指数估值日频历史，需 2000 积分；已实测当前 token 无权限，错误码 40203）。这是剩余的数据接入任务。")
 
     (ROOT / "runs" / "fundamental_valuation.md").write_text("\n".join(L), encoding="utf-8")
 
@@ -118,7 +118,7 @@ def main():
     print("基本面/估值因子诊断（快照）")
     print("=" * 90)
     print(snap[["etf", "index", "pe", "dividend_yield", "earnings_yield",
-                "pe_pct_1y", "pb_pct_1y", "erp"]].to_string(index=False))
+                "pe_pct_hist", "pb_pct_hist", "erp"]].to_string(index=False))
     if r10y:
         print(f"\n10Y 国债收益率 = {r10y:.2f}%")
     print("\nMarkdown 已写入: runs/fundamental_valuation.md")

@@ -6,8 +6,8 @@
       覆盖中证/上证指数，返回最新约 20 个交易日的「市盈率1/2 + 股息率1/2」。
       —— 用于 A 股权益 ETF 的估值快照（单截面 PE / 股息率）。
   * 乐咕乐股 `stock_index_pe_lg(symbol)` / `stock_index_pb_lg(symbol)`：
-      约 1 年日频 PE / PB（滚动市盈率等），仅覆盖少数宽基指数
-      （沪深300/中证500/上证50/中证红利…）。—— 用于短窗口估值分位。
+      月频完整历史（2005 至今约 250 个月，非「近 1 年」），仅覆盖少数宽基
+      （沪深300/中证500/上证50）。—— 用于全历史估值分位 + 时序估值择时。
   * 债券收益率 `bond_zh_us_rate()`：中国 10 年期国债收益率，作债券 carry 参考。
 
 ⚠️ 已知局限（重要）：
@@ -75,7 +75,11 @@ def fetch_csindex_snapshot(code: str) -> dict:
 
 
 def fetch_lg_pe(symbol: str) -> pd.DataFrame:
-    """乐咕乐股近 1 年日频市盈率（滚动市盈率 = TTM）。返回 [日期, pe]。"""
+    """乐咕乐股市盈率完整历史（月频，2005 至今，非「近 1 年」）。返回 [日期, pe]。
+
+    注意：乐咕 index-basic-pe API 返回的是月频完整历史（约 250 个月），
+    仅覆盖少数宽基（上证50/沪深300/中证500）。pe=滚动市盈率(TTM)。
+    """
     df = ak.stock_index_pe_lg(symbol=symbol)
     out = pd.DataFrame({
         "date": pd.to_datetime(df["日期"]),
@@ -85,7 +89,7 @@ def fetch_lg_pe(symbol: str) -> pd.DataFrame:
 
 
 def fetch_lg_pb(symbol: str) -> pd.DataFrame:
-    """乐咕乐股近 1 年日频市净率。返回 [日期, pb]。"""
+    """乐咕乐股市净率完整历史（月频，2005 至今）。返回 [日期, pb]。"""
     df = ak.stock_index_pb_lg(symbol=symbol)
     pb_col = "市净率" if "市净率" in df.columns else df.columns[-1]
     out = pd.DataFrame({
@@ -121,22 +125,93 @@ def fetch_valuation_snapshot() -> pd.DataFrame:
             rec.update(pe=None, pe_static=None, dividend_yield=None,
                        snap_date=None, csindex_err=str(e)[:40])
 
-        # 乐咕 1 年 PE/PB → 当前分位（仅在能拿到时）
-        rec["pe_pct_1y"] = None
-        rec["pb_pct_1y"] = None
+        # 乐咕完整历史 PE/PB → 当前值在全历史的分位（仅在能拿到时）
+        # 注意：这是「2005 至今完整历史」分位，不是「近 1 年」分位。
+        rec["pe_pct_hist"] = None
+        rec["pb_pct_hist"] = None
         if lg_sym:
             try:
                 pe_hist = fetch_lg_pe(lg_sym)
-                rec["pe_pct_1y"] = float((pe_hist["pe"] <= pe_hist["pe"].iloc[-1]).mean())
+                rec["pe_pct_hist"] = float((pe_hist["pe"] <= pe_hist["pe"].iloc[-1]).mean())
             except Exception:
                 pass
             try:
                 pb_hist = fetch_lg_pb(lg_sym)
-                rec["pb_pct_1y"] = float((pb_hist["pb"] <= pb_hist["pb"].iloc[-1]).mean())
+                rec["pb_pct_hist"] = float((pb_hist["pb"] <= pb_hist["pb"].iloc[-1]).mean())
             except Exception:
                 pass
         rows.append(rec)
     return pd.DataFrame(rows)
+
+
+# --------------------------------------------------------------------------- #
+# 乐咕乐股月频估值历史（2005 至今）——免费源唯一可得的「多年点-in-time」估值序列
+# --------------------------------------------------------------------------- #
+# 实测（2026-08-31）：乐咕 index-basic-pe/pb 仅覆盖少数宽基（上证50/沪深300/中证500
+# 有数据，其余 9 个宽基/风格指数返回空）。数据为月频（月末），2005 年至今约 250 个月。
+# 用途：时序估值择时检验（单标的「估值分位 → 未来收益」），无法做多标的截面 IC。
+LEGU_BROAD_INDEXES: dict[str, str] = {
+    "上证50": "510050.SH",
+    "沪深300": "510300.SH",
+    "中证500": "510500.SH",
+}
+
+
+def fetch_lg_monthly(symbol: str) -> pd.DataFrame:
+    """乐咕乐股月频估值历史（完整，2005 至今）。返回 [close, pe_ttm, pe_lyr]。
+
+    index 为月末日期。pe_ttm=滚动市盈率(TTM)，pe_lyr=静态市盈率(LYR)，
+    close=指数收盘点位（用于算未来收益）。
+    """
+    df = ak.stock_index_pe_lg(symbol=symbol)
+    # 注意：用 .to_numpy() 传裸值，避免 pd.DataFrame(dict, index=...) 按索引对齐
+    # 导致全 NaN 的坑（dict 内 Series 是 RangeIndex，index 是日期索引，对齐失败）。
+    out = pd.DataFrame({
+        "close": pd.to_numeric(df["指数"], errors="coerce").to_numpy(),
+        "pe_ttm": pd.to_numeric(df["滚动市盈率"], errors="coerce").to_numpy(),
+        "pe_lyr": pd.to_numeric(df["静态市盈率"], errors="coerce").to_numpy(),
+    }, index=pd.to_datetime(df["日期"]))
+    return out.dropna(subset=["pe_ttm"]).sort_index()
+
+
+# --------------------------------------------------------------------------- #
+# Tushare Pro 指数估值历史（index_dailybasic，日频 PE/PB，需 2000 积分）
+# --------------------------------------------------------------------------- #
+# index_dailybasic 返回指数日频 PE(TTM)/PB/市值，是「多年 × 多标的」截面 IC 的
+# 正确数据源；但需 2000 积分。低积分 token 会抛 code=40203 无权限。
+# ts_code 后缀（.SH/.SZ）为按代码段推断（000xxx=上交所、399xxx=深交所），
+# 待 token 有权限后可用 index_basic 校验修正。
+TS_INDEX_MAP: dict[str, str] = {
+    "510300.SH": "000300.SH",   # 沪深300
+    "510500.SH": "000905.SH",   # 中证500
+    "159915.SZ": "399006.SZ",   # 创业板指
+    "512010.SH": "000933.SH",   # 中证医药
+    "159928.SZ": "000932.SH",   # 中证消费
+    "512880.SH": "399975.SZ",   # 证券公司
+    "512660.SH": "399967.SZ",   # 中证军工
+}
+
+
+def fetch_tushare_index_dailybasic(etf_code: str, start: str, end: str) -> pd.DataFrame:
+    """Tushare 指数估值日频历史（pe_ttm/pb/市值）。需 2000 积分，否则抛权限错误。
+
+    参数 start/end 为 YYYY-MM-DD。返回 index=date 的 [pe_ttm, pb, total_mv, float_mv]。
+    """
+    import tushare as ts
+    from config.settings import settings
+    if not settings.TUSHARE_TOKEN:
+        raise RuntimeError("未配置 TUSHARE_TOKEN（.env）")
+    ts_code = TS_INDEX_MAP.get(etf_code)
+    if ts_code is None:
+        raise KeyError(f"{etf_code} 无 Tushare 指数映射")
+    pro = ts.pro_api(settings.TUSHARE_TOKEN)
+    df = pro.index_dailybasic(ts_code=ts_code, start_date=start.replace("-", ""),
+                              end_date=end.replace("-", ""))
+    if df is None or df.empty:
+        return pd.DataFrame()
+    out = df[["trade_date", "pe_ttm", "pb", "total_mv", "float_mv"]].copy()
+    out["date"] = pd.to_datetime(out["trade_date"])
+    return out.set_index("date").sort_index()
 
 
 if __name__ == "__main__":
