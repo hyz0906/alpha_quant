@@ -1,225 +1,118 @@
-1.  **原子化任务 (Atomic Tasks)**：将大目标拆解为 AI 可独立执行的最小单元。
-2.  **上下文锚定 (Context Anchoring)**：明确文件路径、依赖库版本和输入/输出接口。
-3.  **伪代码即规范 (Pseudocode as Spec)**：对核心逻辑（如 IOPV 计算、RSRS 择时）提供数学到代码的直接映射，防止 AI 幻觉。
+# AlphaQuant 策略设计文档
 
------
+> 2026-09-01 重写。本文档描述**现行策略体系**（三层组合）的设计与验证。
+> 旧版 Design.md（Quantamental-Pro 蓝图，RSRS 时代）已不适用，归档于 git 历史。
+> 标的池明细见 `UNIVERSE.md`，实盘执行见 `TRADING_GUIDE.md`。
 
-# System Manifest: Quantamental-Pro (Full Stack Quant System)
+## 1. 策略体系总览
 
-**Target Executor**: Autonomous Coding Agent
-**Project Root**: `/workspace/quant_system`
-**Environment**: Python 3.10+, Docker (PostgreSQL/Redis)
+现行实盘口径 = **三层组合**：
 
-## 0\. 全局配置与上下文 (Global Context)
-
-### 0.1 技术栈锁定 (Tech Stack Lock)
-
-  * **Data**: `tushare`, `akshare`, `sqlalchemy`, `psycopg2-binary`, `redis`
-  * **Calc**: `pandas`, `numpy`, `scipy`
-  * **Strategy**: `backtrader`
-  * **AI**: `openai` (compatible SDK for DeepSeek), `pymupdf4llm`
-  * **Web**: `streamlit` (Phase 3 Dashboard)
-  * **Execution**: `xtquant` (Mocked for Linux dev env, Deployment on Windows)
-
-### 0.2 目录结构规范 (Master Directory Tree)
-
-Agent **必须** 严格遵守此文件结构，不得随意创建根目录文件。
-
-```text
-/workspace/quant_system
-├── .env.example                # 环境变量模板
-├── docker-compose.yml          # PG & Redis 基础设施
-├── requirements.txt
-├── config/
-│   ├── settings.py             # 读取 env 并导出配置对象
-│   └── logging_config.py       # 日志配置
-├── src/
-│   ├── database/
-│   │   ├── models.py           # SQLAlchemy Schema
-│   │   └── connection.py       # DB Session Manager
-│   ├── data_engine/
-│   │   ├── tushare_loader.py   # 历史数据同步
-│   │   ├── realtime_feed.py    # AkShare 实时流
-│   │   └── qdii_calc.py        # IOPV 计算器
-│   ├── strategies/
-│   │   ├── factors/
-│   │   │   └── rsrs.py         # RSRS 因子库
-│   │   └── signal_generator.py # 信号生成逻辑
-│   ├── backtest/
-│   │   ├── feeds.py            # 自定义 DataFeed
-│   │   └── engine.py           # Backtrader 运行入口
-│   ├── llm_agent/
-│   │   ├── crawler.py          # 研报爬虫
-│   │   └── analyzer.py         # DeepSeek 接口
-│   └── execution/
-│       ├── qmt_client.py       # MiniQMT 封装
-│       └── risk_manager.py     # 风控模块
-└── main.py                     # CLI 入口
+```
+W_final(t+1) = W_invvol(t) × PB_gate(t) × QDII_gate(t)
 ```
 
------
+- **底仓**：18 只异构 ETF 逆波动风险平价，月末定权、次月持有（`risk_parity.build_weights`）
+- **PB 门控**：沪深300 PB 5 年滚动分位三档，作用于 A 股 7 腿（月频）
+- **QDII 门控**：溢价一阶差分 60 日 z 飙升回避状态机，作用于 QDII 6 腿（日频）
+- **乘法门控**：任一腿被门控减出 = 现金（收益 0），**不重新归一**
 
-## Phase 1: Infrastructure & Data Logic (Task ID: P1-xx)
+样本内绩效（`strategy_matrix.py`，2020-08-26~2026-08-31，1453 交易日，
+统一 0.15% 单边成本、T→T+1 无前视）：
 
-### [P1-01] 基础设施搭建
+| 指标 | 三层全开（THREE） | 逆波动基线（INV） |
+|---|---|---|
+| 净年化 | +7.08% | +5.97% |
+| 夏普 | **1.31** | 0.85 |
+| 最大回撤 | **−5.4%** | −10.0% |
+| 换手/年 | 3.39 | — |
 
-  * **Action**: 创建 `docker-compose.yml`。
-  * **Spec**:
-      * Service 1: `postgres:15` (Port 5432, User/Pass from env).
-      * Service 2: `redis:7` (Port 6379).
-  * **Action**: 创建 `src/database/models.py`。
-  * **Schema Spec**:
-      * `MarketData`: `ts_code(PK), trade_date(PK), open, high, low, close, vol`
-      * `FactorData`: `ts_code(PK), trade_date(PK), rsrs_beta, rsrs_zscore, rsrs_r2`
+三个组件各自独立验证有效（§7.13/§7.19/§7.18），组合层叠加**无内耗**：
+PB 门控「不增收益只控回撤」，QDII 门控「收益风险双改善」，三层全开风险调整后
+全局最优。
 
-### [P1-02] Tushare 数据管道
+## 2. 组件 1：逆波动底仓
 
-  * **File**: `src/data_engine/tushare_loader.py`
-  * **Function**: `sync_daily_data(ts_code, start_date, end_date)`
-  * **Logic**:
-    1.  初始化 Tushare Pro API。
-    2.  调用 `daily` 接口获取行情。
-    3.  调用 `adj_factor` 获取复权因子。
-    4.  计算**前复权 (Forward Adjusted)** 价格。
-    5.  使用 `pandas.to_sql` (method='multi') 批量写入 `MarketData` 表。
-    6.  **Constraint**: 必须处理重复主键冲突 (Upsert logic)。
+**原理**：波动率倒数加权，让每只资产对组合波动贡献近似相等；月频再平衡抑制换手。
 
-### [P1-03] RSRS 因子核心算法 (向量化)
+- 权重 = 月末前 60 交易日波动率倒数，归一化；次月持有不变（ffill）
+- 实盘语义：「明日权重」= `build_weights(panel).iloc[-1]`（月末则新算，否则延续）
+- 池：18 只异构 ETF（7 股 + 6 QDII + 1 债 + 1 货币 + 3 商品），共同样本 2020-08 起
 
-  * **File**: `src/strategies/factors/rsrs.py`
-  * **Function**: `calculate_rsrs_vectorized(df: pd.DataFrame, N=18, M=600) -> pd.DataFrame`
-  * **Logic (Strict)**:
-    1.  **Input**: DataFrame 必须包含 `high`, `low`。
-    2.  **Rolling Regression**:
-          * 使用 `numpy.lib.stride_tricks.sliding_window_view` 构建滚动窗口，避免循环。
-          * 对每个窗口执行 OLS 回归: $High = \beta \times Low + \alpha$。
-          * 提取 $\beta$ (斜率) 和 $R^2$。
-    3.  **Z-Score**: `z_score = (beta - rolling_mean(beta, M)) / rolling_std(beta, M)`
-    4.  **Correction**: `rsrs_score = z_score * r2 * sign(z_score)`
-    5.  **Output**: 返回添加了 `rsrs_score` 列的 DataFrame。
+**为什么不用 ERC**：ERC 样本内略优但依赖协方差估计、更不稳；逆波动简单稳健，
+§7.13 证明 18 只池逆波动夏普 0.87 vs 等权 0.51。
 
-### [P1-04] 混合周期回测框架
+## 3. 组件 2：PB 估值门控（A 股 7 腿，月频）
 
-  * **File**: `src/backtest/feeds.py`
-  * **Class**: `HybridPandasData(bt.feeds.PandasData)`
-  * **Spec**:
-      * 增加 lines: `('rsrs_score', 'market_type')`
-      * `market_type`: 0=A股(T+1), 1=QDII(T+0)。
-  * **File**: `src/backtest/engine.py`
-  * **Class**: `HybridStrategy(bt.Strategy)`
-  * **Logic**:
-      * 在 `next()` 中，若 `d.market_type == 0` (A股)，使用默认下单。
-      * 若 `d.market_type == 1` (QDII)，开启 `broker.set_coo(True)` (Cheat-On-Open) 模拟 T+0 或在回测引擎层手动处理日内平仓逻辑。
+**原理**：A 股宽基的 PB 分位有长期均值回归；高估区降仓、低估区满仓。
 
------
+- 信号源：**沪深300** PB（乐咕月频），5 年滚动分位（窗口 60 月、最小样本 36）
+- 三档规则（`triple`）：分位 <30% → 全仓；30~70% → 半仓（×0.5）；≥70% → 空仓（×0）
+- 应用时点：**t 月末分位 → t+1 月应用（shift(1)）**
 
-## Phase 2: Live Execution & Arbitrage (Task ID: P2-xx)
+> ⚠️ **shift(1) 是刻意的、经过验证的口径，不得「修正」**：t+1 月实际用的是
+> t−1 月末分位（比直觉多滞后一个月），但回测 1.31 夏普就是这个口径跑出来的。
+> 乐咕数据月初才更新上月末点，实盘也天然只能这样用。
 
-### [P2-01] QDII 影子净值计算器
+## 4. 组件 3：QDII 溢价门控（QDII 6 腿，日频）
 
-  * **File**: `src/data_engine/qdii_calc.py`
-  * **Function**: `get_realtime_premium(etf_code, benchmark_future_symbol)`
-  * **Logic**:
-    1.  Fetch `Last_NAV` (T-1 净值) from DB.
-    2.  Fetch `Realtime_Future_Pct` (美股期货涨跌) via AkShare (`ak.futures_foreign_commodity_realtime`).
-    3.  Fetch `USD_CNY` rate via AkShare.
-    4.  **Formula**:
-        $$IOPV_{now} = NAV_{last} \times (1 + Future\%) \times \frac{Rate_{now}}{Rate_{base}}$$
-        $$Premium = \frac{Price_{market}}{IOPV_{now}} - 1$$
-    5.  **Output**: Float (溢价率，如 0.02 代表 2%)。
+**原理**：QDII 溢价飙升（z>+2 且溢价>1%）= 额度骤紧/抢购 → 次日空仓；等 z
+回落 ≤+2 且空仓 ≥5 日回补。2024 起 QDII 额度告罄使**绝对溢价**结构性抬升
+（纳指 2026 全年 94% 时间溢价>3%），绝对阈值失效，改用**相对变化**信号。
 
-### [P2-02] MiniQMT 交互层 (Mockable)
+- 信号：`relchange_zscore(premium)` —— 溢价一阶差分 60 日滚动 z，
+  滚动均值/标准差**滞后 1 期**（无前视）
+- 状态机：`spike_avoid_hold(z, premium)`（`qdii_relchange_realistic.py`）
+  - 参数：floor=1%（z 高但溢价低不触发）、min_hold=5（空仓最短 5 日）、z=+2
+  - 实盘约束版：min_hold 贴合 QDII T+2 到账，floor 过滤低溢价噪声
+- 实盘「明日持仓」技巧：溢价序列**末尾追加一行 NaN** 再跑状态机，取末值——
+  状态机处理完真实数据后的 state 即 T+1 持仓（与回测 T→T+1 语义一致）
 
-  * **File**: `src/execution/qmt_client.py`
-  * **Design**:
-      * 由于开发环境可能无 MiniQMT，需创建一个 `BaseTrader` 接口。
-      * 实现 `RealTrader` (调用 `xtquant`) 和 `MockTrader` (仅打印日志)。
-      * **Method**: `place_order(code, amount, action, strategy_id)`
-      * **Method**: `get_positions()`
-  * **Constraint**: 所有交易指令必须先推送到 Redis 队列 `trade_instruction_queue`，由该脚本作为 Consumer 消费执行。
+**已知滞后代价**：净值 T+1~T+2 公布 → 实盘门控比回测慢 1~2 天，实盘夏普
+~1.0（回测 1.31 高估 ~0.3）；定时任务已从 15:30 挪到 21:30 缓解
+（`scripts/archive/gate_lag_test.py` 量化）。
 
-### [P2-03] 自动化调度器
+## 5. 回测口径（全策略统一，新策略准入基准）
 
-  * **File**: `main.py` (Command Pattern)
-  * **Commands**:
-      * `python main.py update_data`: 运行 Tushare Loader。
-      * `python main.py calc_factors`: 运行 RSRS 计算并更新 DB。
-      * `python main.py monitor`: 启动死循环，每 3 秒计算一次 QDII 溢价，若 `abs(premium) > 0.03`，触发 Redis 报警信号。
+`strategy_matrix.py` 固定以下口径，任何脚本对比必须先对齐：
 
------
+1. **池**：18 只共同样本（公共区间 2020-08-26 起）
+2. **成本**：单边 0.15%（月度再平衡 + 门控翻转都计）
+3. **信号滞后**：T 日信号 → T+1 应用（build_weights shift(1)、PB shift(1) 月、
+   QDII 状态机 T→T+1）
+4. **指标**：年化毛/净收益、净夏普、净回撤、换手/年、成本侵蚀、期末净值
 
-## Phase 3: AI Agent & Quantamental (Task ID: P3-xx)
+10 策略矩阵结论（§7.26）：
 
-### [P3-01] 研报处理 Pipeline
+| 组 | 策略 | 夏普 | 结论 |
+|---|---|---|---|
+| 基准 | EW18 等权 | 0.52 | 基线 |
+| 基准 | INV 逆波动 | 0.85 | 基线 |
+| 消融 | VALUE（PB） | 1.03 | 只控回撤 |
+| 消融 | QDII_ABS（>3%空仓） | 1.27 | 净年化最高但换手 4.30 |
+| 消融 | QDII_REL（理想版） | 1.04 | 无 floor/min_hold |
+| 消融 | QDII_REAL（实盘版） | 1.08 | floor+min_hold 有效 |
+| 消融 | QDII_DISC（折价买入） | 0.90 | 弱 |
+| 消融 | **THREE（三层全开）** | **1.31** | **现行实盘口径** |
+| 轮动 | ROT_EB（股债MA200） | 0.01 | 证伪 |
+| 轮动 | BH300（买入持有） | 0.08 | 单资产对照 |
 
-  * **File**: `src/llm_agent/crawler.py`
-  * **Action**: 使用 `requests` 获取东方财富研报 PDF URL（模拟 Headers 必不可少）。
-  * **File**: `src/llm_agent/converter.py`
-  * **Action**: 使用 `pymupdf4llm.to_markdown(pdf_path)` 将 PDF 转为 Markdown。
+## 6. 已证伪方向（防止重复投入）
 
-### [P3-02] DeepSeek 分析器
+| 假设 | 验证 | 结论 |
+|---|---|---|
+| 截面价值（PB/PE/股息率）IC | `danjuan_cross_ic.py` | 全因子全持有期不显著（NW-t<1.2），贵者恒强 |
+| 截面动量倾斜 | `portfolio_momentum_tilt.py` | 边缘显著（NW-t 1.84）但倾斜层单调有害 |
+| QDII 门控周频降频 | `qdii_gate_weekly_test.py` | 周频夏普 1.31→1.08，日频价值=及时离场 |
+| 股债 MA200 轮动 | `rotation_test.py` | 夏普 0.01，证伪 |
+| RSRS 趋势择时 | 早期路线 | 已被三层组合取代 |
 
-  * **File**: `src/llm_agent/analyzer.py`
-  * **Function**: `analyze_report(markdown_text)`
-  * **Spec**:
-      * Client: `openai.OpenAI(base_url="https://api.deepseek.com", api_key=...)`
-      * **System Prompt**:
-        ```text
-        你是一个严谨的量化基本面分析师。请分析研报并输出 JSON:
-        {
-          "sentiment": float (-1.0 to 1.0),
-          "confidence": float (0.0 to 1.0),
-          "key_drivers": ["string"],
-          "risks": ["string"]
-        }
-        ```
-      * **Constraint**: 必须使用 JSON Mode (`response_format={"type": "json_object"}`) 确保程序可解析。
+## 7. 诚实边界
 
-### [P3-03] 信号融合 (Signal Fusion)
-
-  * **File**: `src/strategies/signal_generator.py`
-  * **Logic**:
-      * 读取 `FactorData` 中的 RSRS Score。
-      * 读取 `ReportSentiment` 中的 Sentiment Score。
-      * **Fusion Logic**:
-        ```python
-        if rsrs > 0.7 and sentiment > 0.2:
-            signal = "STRONG_BUY"
-        elif rsrs > 0.7 and sentiment < -0.2:
-            signal = "DIVERGENCE_WATCH" # 技术面好但基本面差，减仓观察
-        else:
-            signal = "HOLD/SELL"
-        ```
-
-### [P3-04] Streamlit Dashboard
-
-  * **File**: `src/dashboard/app.py`
-  * **Action**:
-      * Page 1: **Market Monitor**. 显示 QDII 实时溢价表 (Auto-refresh every 10s)。
-      * Page 2: **Backtest Viewer**. 上传回测结果 Pickle，绘制 pnl 曲线。
-      * Page 3: **AI Reports**. 展示最近分析的研报及其 Sentiment 打分。
-
------
-
-## Execution Guide for Coding Agent
-
-**Step 1: Initialization**
-Run `mkdir -p` commands to create the directory tree. create `requirements.txt` with specified libraries.
-
-**Step 2: Database Layer**
-Implement `models.py` and bring up Docker containers. Verify connection string.
-
-**Step 3: Data Ingestion**
-Implement `tushare_loader.py`. *Verification*: Run script to fetch '000001.SZ' for last 30 days and query DB to confirm data.
-
-**Step 4: Strategy Logic**
-Implement `rsrs.py`. *Verification*: Create a dummy CSV with clear uptrend, check if `rsrs_score` \> 0.8.
-
-**Step 5: AI Integration**
-Implement `analyzer.py`. *Verification*: Pass a dummy text "Company profit doubled" to DeepSeek API and verify JSON output contains positive sentiment.
-
-**Step 6: System Integration**
-Tie everything together in `main.py` with CLI arguments (`argparse`).
-
-**Step 7: Real Trading Simulation**
-Implement `qmt_client.py` with Mock mode enabled. Simulate a "Buy" signal flow from Strategy -\> Redis -\> Execution -\> Log.
+1. **样本内验证**：6 年窗口不含 2008/2015 完整熊市（PB 门控强项年份缺席）；
+   2025 单边牛市三层跑输基线 ~1.9pp、2020 下半年踏空 ~2.2pp。
+2. **PB 用沪深300 代理全 A 股**：对中证500/创业板腿是简化假设（§7.19 证明
+   PB 择时对中小成长宽基无效）。
+3. **QDII 执行风险**：限购导致「想买回时买不回」；T+2 到账；净值滞后 1~2 天。
+4. **信号级 ≠ 成交级**：输出目标权重，未含滑点/冲击/最小交易单位。
+5. 敏感性稳健（9 变体夏普 1.05~1.43 全 >1）但**不据此调参**（样本内选择禁忌）。
