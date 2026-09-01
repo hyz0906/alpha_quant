@@ -1,42 +1,60 @@
-# AlphaQuant × Vibe-Trading 集成工作流
+# AlphaQuant 开发与验证工作流（完整日志）
 
-> 2026-08-30 集成版。本文档是完整工作流的权威说明：模块职责、调用顺序、
-> 输入输出依赖、以及"需 API key 的组件被 vibe-trading 免费模块替代"的对照表。
+> 本文档是**开发/验证日志**：从 RSRS × Vibe-Trading 集成（2026-08）到三层组合
+> 落地（2026-09）的全过程。§0~§6 为早期集成背景，§7.x 为逐轮实验证据，
+> §9 为最终收口结论。
+>
+> ⚠️ **当前生产形态不是早期章节描述的 RSRS 链路**。现行系统 = 三层组合
+> （逆波动底仓 × PB 估值门控 × QDII 溢价门控），QDII 溢价套利为独立模块。
+> 权威描述见 `ARCHITECTURE.md`（系统形态）/ `Design.md`（策略设计）/
+> `USAGE.md`（用法）/ `UNIVERSE.md`（标的池）/ `TRADING_GUIDE.md`（人工交易）/
+> `AGENTS.md`（编码代理上下文）。早期 RSRS/vibe 内容保留为历史背景，
+> **勿按 §0~§6 的旧命令操作生产**。
 
-## 0. 一图流
+## 0. 一图流（现行生产链）
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
-│  python3 main.py run_all --codes 512480.SH,513100.SH,588000.SH     │
+│  crontab：工作日 21:30  →  scripts/qdii_daily.py（唯一编排入口）      │
 └─────────────────────────────────────────────────────────────────────┘
+   │  任一步失败不影响其余步骤（错误隔离）；数据缺失一律降级容忍 + 告警
+   ├─① qdii_monitor.py      溢价监控快照 → runs/qdii_premium.md/.json
+   │                         官方/影子 IOPV 溢价 + 相对变化 z 告警（z≥+2 飙升）
    │
-   ├─(1) fetch_data ──► VibeMarketLoader ──► 子进程 broker (cwd=$HOME)
-   │                      │                    └─ vibe fetch_market_data
-   │                      │                       (tencent 链, 免token, qfq)
-   │                      ├─► data/<code>.csv
-   │                      └─► upsert alphaquant.db.market_data
+   ├─② qdii_backtest.py --refresh
+   │                         净值增量刷新(缓存末日期−14天) → data/fundamental/qdii_premium_*.csv
+   │                         溢价回避/折价买入回测 → runs/qdii_backtest.md/.json
    │
-   ├─(2) calc_factors ─► RSRSCalculator(向量化, N=18, M=600)
-   │                      ├─► market_data.rsrs_beta/r2/zscore 回写
-   │                      └─► upsert factor_data
+   └─③ portfolio_live.py    三层组合明日信号 → runs/portfolio_live.md/.json
+                             逆波动底仓(18池) × PB门控(A股7腿) × QDII门控(6腿)
+                             输出：明日目标持仓 + 动作清单（≥0.5pp 变动）
    │
-   ├─(3) gen_signals ──► SignalGenerator.generate_rotation_signals
-   │                      ├─► output/signals_YYYYMMDD.json (top_k 等权)
-   │                      └─► (可选) RSRS+研报情感融合 [P3-03]
-   │
-   ├─(4) backtest ─────► VibeBacktestExporter
-   │                      ├─► CSV 注入 vibe loader cache (tushare 槽位)
-   │                      ├─► runs/<name>/config.json + code/signal_engine.py
-   │                      └─► 子进程: python -m backtest.runner (cwd=$HOME)
-   │                          ├─ 缓存全命中 → 不调 API、不需要 token
-   │                          ├─ ChinaAEngine: T+1/整手/涨跌停/佣金
-   │                          │   (ETF: stamp_tax=0)
-   │                          └─► runs/<name>/ 回测结果
-   │
-   └─(5) monitor ──────► QDIICalculator (akshare) — 独立实时环节
+   ▼
+  人工阅读 runs/portfolio_live.md → 按动作清单下单（TRADING_GUIDE.md）
+
+数据源（全部免费）：东财(净值/IOPV/spot) · 新浪(收盘/全球指数/汇率) · 乐咕(PB) · 腾讯 qfq(vibe broker)
+历史 RSRS 链路（main.py run_all：fetch→factors→signals→backtest）已证伪，验证史见 §7。
 ```
 
 ## 1. 模块清单与职责
+
+### 1.1 现行生产链（三层组合，2026-09 起）
+
+| 脚本 | 角色 | 说明 |
+|---|---|---|
+| `scripts/qdii_daily.py` | 编排入口 | 三步串行、错误隔离、日志追加 `logs/qdii_daily.log` |
+| `scripts/qdii_monitor.py` | ① 监控 | 官方/影子 IOPV 溢价 + 相对变化 z 告警（口径与回测一致） |
+| `scripts/qdii_backtest.py` | ② 刷新 | 净值增量刷新（末日期−14 天窗口）+ 溢价回避/折价买入回测 |
+| `scripts/portfolio_live.py` | ③ 信号 | 三层门控状态 + 明日目标权重 + 动作清单 |
+| `scripts/portfolio_combined.py` | 研究 | 三层组合联合回测（A/B/C/D 消融） |
+| `scripts/strategy_matrix.py` | 研究 | 10 策略统一横评（新策略准入基准） |
+| `scripts/risk_parity.py` | 共享库 | 18 只池定义、逆波动/ERC 权重、指标 |
+| `scripts/qdii_relchange_backtest.py` / `qdii_relchange_realistic.py` | 共享库 | 相对变化门控状态机（理想版/实盘约束版） |
+| `scripts/value_timing_backtest.py` | 研究 | PB 门控独立回测 |
+| `scripts/vibe_fetch_broker.py` | 数据 | vibe broker 行情拉取封装（ETF 前复权收盘） |
+| `src/data_engine/qdii_calc.py` | 核心计算 | 影子 IOPV 溢价、`relchange_zscore`、池映射 |
+
+### 1.2 早期 RSRS 链路模块（2026-08 集成，已证伪，保留作历史）
 
 | 环节 | 模块 | 输入 | 输出 |
 |---|---|---|---|
@@ -61,9 +79,33 @@ fetch_data ──► calc_factors ──► gen_signals        # 生产链路（
 
 ## 3. 常用命令（WSL 内执行）
 
+### 3.0 生产链命令（现行，优先使用）
+
 ```bash
 cd ~/workspace/alpha_quant
 
+# 每日编排：①监控快照 → ②净值刷新+回测 → ③组合信号（已接 crontab 21:30）
+python3 scripts/qdii_daily.py
+python3 scripts/qdii_daily.py --skip-backtest --skip-portfolio   # 只跑监控
+
+# 组合信号（明日目标持仓 + 动作清单）→ runs/portfolio_live.md
+python3 scripts/portfolio_live.py
+python3 scripts/portfolio_live.py --no-refresh   # 调试：仅用本地缓存
+
+# 监控快照 / 回测刷新
+python3 scripts/qdii_monitor.py                  # → runs/qdii_premium.md/json
+python3 scripts/qdii_backtest.py --refresh       # 增量刷新净值(末日期−14天) + 回测
+python3 scripts/qdii_backtest.py                 # 仅用缓存重算
+
+# 研究（非每日）
+python3 scripts/strategy_matrix.py               # 10 策略统一横评（新策略准入）
+python3 scripts/portfolio_combined.py            # 三层组合消融回测
+python3 scripts/value_timing_backtest.py         # PB 门控独立回测
+```
+
+### 3.0b 历史 RSRS 链路命令（已证伪，仅研究/回溯用）
+
+```bash
 # 一步到位：拉数据 → 算因子 → 出信号 → 跑回测
 python3 main.py run_all --codes 512480.SH,513100.SH,588000.SH \
     --start 2024-01-01 --start-fetch 2020-01-01 --top-k 2
@@ -82,13 +124,6 @@ python3 main.py sliding_backtest --name sliding_20260831 \
     --window-months 6 --step-months 6 \
     --strategies rsrs_rotation,rsrs_timing,equal_weight
 # 结果: runs/<name>/summary.md + summary.json + 每窗每策略一个子 run 目录
-
-# QDII 溢价监控（独立，收盘快照）
-python3 main.py monitor                      # 旧：实时轮询（while True）
-python3 scripts/qdii_monitor.py              # 单次快照 -> runs/qdii_premium.md/json
-python3 scripts/qdii_backtest.py             # 套利回测(读缓存) -> runs/qdii_backtest.md/json
-python3 scripts/qdii_backtest.py --refresh   # 强制重拉历史溢价序列(每日追加最新数据点)
-python3 scripts/qdii_daily.py                # 每日编排：监控快照 + 回测刷新(已接 crontab)
 ```
 
 ### 3.2 滑动窗口回测（sliding_backtest）

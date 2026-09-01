@@ -46,8 +46,10 @@ python3 scripts/portfolio_live.py --no-refresh
 | [USAGE.md](USAGE.md) | 使用说明：安装、配置、各脚本用法、产物解读 |
 | [UNIVERSE.md](UNIVERSE.md) | 标的清单：18 只池、6 只 QDII 底层映射、数据文件 |
 | [TRADING_GUIDE.md](TRADING_GUIDE.md) | 人工交易指导：信号解读、动作执行、实盘注意事项 |
-| [WORKFLOW.md](WORKFLOW.md) | 完整开发/验证日志（1346 行，含 §7.x 全部实验） |
-| [AGENTS.md](AGENTS.md) / [Background.md](Background.md) / [STRATEGY_PLAN.md](STRATEGY_PLAN.md) | 历史文档（RSRS 时代，部分内容已过时） |
+| [WORKFLOW.md](WORKFLOW.md) | 完整开发/验证日志（§7.x 全部实验 + §9 收口结论） |
+| [AGENTS.md](AGENTS.md) | 面向 AI 编码代理的项目上下文（生产链分层 / 编码约定 / 不得修正的口径） |
+| [STRATEGY_PLAN.md](STRATEGY_PLAN.md) | 策略体系全景：10 策略矩阵、已证伪方向、剩余增强 |
+| [Background.md](Background.md) | 项目背景与演进史（蓝图 → 证伪 → 三层组合） |
 
 ## 目录结构
 
