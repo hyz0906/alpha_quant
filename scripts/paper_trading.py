@@ -15,6 +15,10 @@
 命令（均在项目根执行，WSL python3）：
   init --capital 200000 [--name 模拟盘]
       初始化账本；已有账本时拒绝（需 --force 重置，会清空历史）。
+  set-holdings --file broker_holdings.csv [--date YYYY-MM-DD] [--note ...]
+      用券商实际持仓一次性同步账本（替代 init+11×buy）：
+      CSV 列 code,shares,cost（券商实际成本价），适用于建仓首日已有完整
+      实际成交清单、跳过中间过程的场景。
   buy  --code 511010.SH --shares 1300 [--price P] [--date YYYY-MM-DD]
       按最新收盘价买入（价格/日期可用参数覆盖）；佣金 = 成交额×0.15%。
   sell --code 511010.SH --shares 300 [--price P] [--date YYYY-MM-DD]
@@ -61,6 +65,13 @@ COST = 0.0015           # 单边佣金（与回测口径一致）
 LOT = 100               # ETF 最小交易单位（份）
 W_DIFF_TH = 0.02        # 对账权重差阈值（2pp）
 MIN_AMT_TH = 200.0      # 对账最小金额差阈值（元）
+
+# vibe tencent 前复权链对部分基金做归一化处理（货币 ETF 净值被等比缩放），
+# 估值与建仓指导需按 IOPV 市价折算。其它标的默认 1.0（不缩放）。
+# 如果该批标的数据改源（接入东方财富 IOPV/乐咕 PV），删除本表即可。
+PRICE_SCALE = {
+    "511180.SH": 8.0,    # 银华日利：vibe 归一价 12.59 → IOPV 100.76
+}
 
 NAMES = {
     "510300.SH": "沪深300", "510500.SH": "中证500", "159915.SZ": "创业板指",
@@ -109,13 +120,18 @@ def save_nav(nav: pd.DataFrame) -> None:
 
 
 def get_last_close(code: str) -> tuple[float, str] | None:
-    """最新收盘价与日期；文件缺失返回 None。"""
+    """最新收盘价与日期；文件缺失返回 None。
+
+    走 PRICE_SCALE 缩放（511180.SH 等货币基金按 IOPV 折算）。
+    返回的是 IOPV 市价，单位 = 元 / 份。
+    """
     p = DATA_DIR / f"{code}.csv"
     if not p.exists():
         return None
     df = pd.read_csv(p, usecols=["date", "close"], parse_dates=["date"])
     row = df.dropna(subset=["close"]).iloc[-1]
-    return float(row["close"]), str(row["date"].date())
+    scale = PRICE_SCALE.get(code, 1.0)
+    return float(row["close"]) * scale, str(row["date"].date())
 
 
 def valuation(positions: dict[str, int]) -> tuple[dict[str, float], dict[str, str]]:
@@ -225,6 +241,76 @@ def cmd_status() -> int:
     for c, sh in sorted(led.get("positions", {}).items(), key=lambda x: -market[x[0]]):
         print(f"  {c} {NAMES.get(c, c):<8} {sh:>7} 份 × {last_dates[c]} 收盘"
               f" = {market[c]:,.2f}（{market[c]/total*100:.1f}%）")
+    return 0
+
+
+def cmd_set_holdings(csv_path: Path, trade_date: str, note: str,
+                    charge_fee: bool = False) -> int:
+    """从券商实际持仓 CSV 一次性初始化账本（替代 init+11×buy）。
+
+    文件格式：header=code,shares,cost（其余列忽略）；可含 comments 行（# 开头）。
+    默认 cost = 券商展示的"成本价"，**已含佣金**，sync 只累加 cost×shares，
+    不再二次扣 0.15%；如传入的是净价则加 --charge-fee 重算佣金。
+    自动校核：合计 cash = capital - Σ amount，不得为负。
+    """
+    led = load_ledger()
+    if led is None:
+        print("⚠️ 账本不存在，请先 init（一次性记录初始资金）。")
+        return 1
+
+    import csv as csvmod
+    rows: list[dict] = []
+    with open(csv_path, "r", encoding="utf-8-sig") as f:
+        for row in csvmod.DictReader(f):
+            if not row.get("code") or row["code"].startswith("#"):
+                continue
+            rows.append(row)
+    if not rows:
+        print(f"⚠️ {csv_path} 无有效行（需 code,shares,cost 三列）。")
+        return 1
+
+    positions: dict[str, int] = {}
+    trades: list[dict] = []
+    total_cost: float = 0.0
+    total_fee: float = 0.0
+    for row in rows:
+        c, sh = row["code"].strip(), int(row["shares"])
+        cost = float(row["cost"])
+        if sh <= 0 or sh % LOT != 0:
+            print(f"⚠️ {c} 份额 {sh} 不是 {LOT} 的整数倍，跳过。")
+            return 1
+        if c not in NAMES:
+            print(f"⚠️ {c} 不在 18 只池，跳过。")
+            return 1
+        amount = round(cost * sh, 2)
+        fee = _fee(amount) if charge_fee else 0.0
+        positions[c] = positions.get(c, 0) + sh
+        total_cost += amount
+        total_fee += fee
+        trades.append({
+            "date": trade_date, "code": c, "side": "buy",
+            "shares": sh, "price": cost, "amount": amount, "fee": fee,
+            "note": f"{note}（券商实际成交价"
+                    + ("，二次计费" if charge_fee else "，含佣金") + "）",
+        })
+
+    cash_left = round(float(led["capital"]) - total_cost - total_fee, 2)
+    if cash_left < 0:
+        print(f"⚠️ 持仓占用 {total_cost+total_fee:,.2f} 元超过初始资金 "
+              f"{led['capital']:,.0f}，请先 init --capital 调高或调整 CSV。")
+        return 1
+
+    led["cash"] = cash_left
+    led["positions"] = positions
+    led["trades"] = trades
+    led["note"] = note
+    save_ledger(led)
+
+    fee_str = f" + 佣金 {total_fee:,.2f}" if charge_fee else ""
+    print(f"✅ 从 {csv_path.name} 同步 {len(positions)} 只持仓（{len(trades)} 笔），"
+          f"占用 {total_cost:,.2f}{fee_str} = 合计 {total_cost+total_fee:,.2f}，"
+          f"剩余现金 {cash_left:,.2f}")
+    print(f"   成交日期：{trade_date}")
     return 0
 
 
@@ -466,7 +552,6 @@ def cmd_reconcile() -> int:
 def main() -> int:
     ap = argparse.ArgumentParser(description="模拟盘账本 + 对账（20 万示例资金）")
     sub = ap.add_subparsers(dest="cmd", required=True)
-
     p_init = sub.add_parser("init", help="初始化账本")
     p_init.add_argument("--capital", type=float, default=200000.0)
     p_init.add_argument("--name", default="模拟盘")
@@ -488,6 +573,18 @@ def main() -> int:
     p_eg.add_argument("--capital", type=float, default=200000.0)
     p_eg.add_argument("--out", type=Path, default=GUIDE_MD)
 
+    p_set = sub.add_parser("set-holdings",
+                           help="从券商实际持仓一次性初始化（替代 init+11×buy）")
+    p_set.add_argument("--file", required=True,
+                       help="CSV 列：code,shares,cost（券商实际成本价，已含佣金）")
+    p_set.add_argument("--date", default=datetime.now().strftime("%Y-%m-%d"),
+                       help="成交日期（默认今日）")
+    p_set.add_argument("--note", default="从券商持仓同步",
+                       help="备注，写入交易流水")
+    p_set.add_argument("--charge-fee", action="store_true",
+                       help="cost 为不含佣金的成交价——额外扣 0.15%%；"
+                            "默认 cost 已含佣金，sync 只扣 cost×shares")
+
     sub.add_parser("reconcile", help="估值 + 对账（qdii_daily 第 4 步）")
     sub.add_parser("status", help="账本视图")
 
@@ -500,6 +597,9 @@ def main() -> int:
         return cmd_trade("sell", args.code, args.shares, args.price, args.date)
     if args.cmd == "entry-guide":
         return cmd_entry_guide(args.capital, args.out)
+    if args.cmd == "set-holdings":
+        return cmd_set_holdings(Path(args.file), args.date, args.note,
+                                args.charge_fee)
     if args.cmd == "reconcile":
         return cmd_reconcile()
     if args.cmd == "status":
