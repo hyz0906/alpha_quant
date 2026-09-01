@@ -202,13 +202,13 @@ def main():
     closes = {c: pd.read_csv(DATA_DIR / f"{c}.csv", parse_dates=["date"]).set_index("date")["close"]
               for c in HETERO_CODES}
     panel18 = pd.DataFrame(closes).sort_index()
-    common = panel18.dropna()   # 全 18 只共同样本（2020-08 起）
+    common = panel18.dropna()   # 全 18 只共同样本（2020-01 起，受 159981 上市日约束）
 
     # 核心三腿（2015 起）
     core = pd.DataFrame({c: closes[c] for c in CORE_TRIO}).dropna()
 
     methods = ["equal", "inverse_vol", "inverse_var", "erc"]
-    r18 = run_universe(common, methods, "18 只异构池（2020-08 起）")
+    r18 = run_universe(common, methods, "18 只异构池（2020-01 起）")
     rcore = run_universe(core, methods, "核心三腿 股/金/债（2015-01 起）")
 
     # ---- 打印 ----
@@ -248,7 +248,7 @@ def main():
     L = ["# 被动基线 + 风险平价组合报告\n",
          "> 月度再平衡，无前视（t 月末用此前 60 日数据定权重，t+1 月持有）。",
          "> 等风险贡献(ERC)用 scipy SLSQP 求解 + 协方差 20% 对角收缩。\n"]
-    for title, r in [("18 只异构池（2020-08 起）", r18), ("核心三腿 股/金/债（2015-01 起）", rcore)]:
+    for title, r in [("18 只异构池（2020-01 起）", r18), ("核心三腿 股/金/债（2015-01 起）", rcore)]:
         L.append(f"## {title}\n")
         L.append("| 策略 | 年化收益 | 年化波动 | 夏普 | 最大回撤 | Calmar | 年化换手 |")
         L.append("|---|---|---|---|---|---|---|")
@@ -279,12 +279,20 @@ def main():
     L.append("\n## 结论要点\n")
     L.append("- **风险平价靠降波动抬夏普，不是选股 alpha**：逆波动/逆方差把权重压向低波资产（国债/黄金），"
              "夏普显著高于等权，但收益端偏保守——本质是「兜底输出」而非超额。")
-    L.append("- **逆波动是甜点位**：18 只池夏普 0.87（vs 等权 0.51）、核心三腿 1.53（vs 0.75），"
-             "换手仅 0.9~1.5 倍/年。逆方差夏普更高但已退化成「几乎全持债」的类债组合。")
-    L.append("- **ERC 边际改善不值换手成本**：ERC 夏普略高（0.94/1.07），但换手 4.3~5.4 倍/年，"
-             "是逆波动的 3~5 倍，计入成本后大概率不如逆波动。→ 兜底组合选**逆波动**。")
-    L.append("- **样本口径说明**：本表「18 只池」用共同样本（2020-08 起，全 18 只齐备），"
-             "等权夏普 0.46~0.51；§7.12 的 0.60 是 2015 起「随上市扩池」口径，两者不可直接比。")
+    # 结论数字从结果动态取值，避免硬编码漂移
+    iv18, ew18 = r18["inverse_vol"]["sharpe"], r18["equal"]["sharpe"]
+    ivc, ewc = rcore["inverse_vol"]["sharpe"], rcore["equal"]["sharpe"]
+    erc18, ercc = r18["erc"]["sharpe"], rcore["erc"]["sharpe"]
+    L.append("- **逆波动是甜点位**："
+             f"18 只池夏普 {iv18:.2f}（vs 等权 {ew18:.2f}）、核心三腿 {ivc:.2f}（vs {ewc:.2f}），"
+             "换手仅 0.8~1.2 倍/年。逆方差夏普更高但已退化成「几乎全持债」的类债组合。")
+    L.append("- **ERC 双重不如逆波动**："
+             f"夏普 {erc18:.2f}/{ercc:.2f}（均低于逆波动 {iv18:.2f}/{ivc:.2f}），"
+             "换手却 5.0/4.7 倍/年——波动率地板后逆波动更稳，ERC 无边际改善。"
+             "→ 兜底组合选**逆波动**。")
+    L.append("- **样本口径说明**：本表「18 只池」用共同样本（2020-01 起，全 18 只齐备，"
+             f"受 159981 上市日约束），等权(月度)夏普 {ew18:.2f}；"
+             "§7.12 的 0.60 是「随上市扩池」另一口径，两者不可直接比。")
     L.append("- 月度再平衡换手远低于 RSRS 周频（152 倍/年），成本友好。")
 
     (ROOT / "runs" / "risk_parity.md").write_text("\n".join(L), encoding="utf-8")
