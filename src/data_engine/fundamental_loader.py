@@ -52,7 +52,7 @@ ETF_INDEX_MAP: dict[str, tuple[str, str, Optional[str]]] = {
 # 债券 / 商品 / 跨境：无 PE，用替代 carry/估值口径（快照仅标注）
 NON_EQUITY_NOTE: dict[str, str] = {
     "511010.SH": "国债ETF——carry=10年期国债收益率",
-    "511180.SH": "可转债ETF——carry=可转债YTM/纯债溢价",
+    "511880.SH": "银华日利——货币基金，无估值（准现金）",
     "518880.SH": "黄金ETF——无carry，估值看实际利率/金价分位",
     "159985.SZ": "豆粕ETF——商品无PE，看期限结构/展期收益",
     "159981.SZ": "能源化工ETF——商品无PE，看期限结构/展期收益",

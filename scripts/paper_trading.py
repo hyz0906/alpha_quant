@@ -66,17 +66,10 @@ LOT = 100               # ETF 最小交易单位（份）
 W_DIFF_TH = 0.02        # 对账权重差阈值（2pp）
 MIN_AMT_TH = 200.0      # 对账最小金额差阈值（元）
 
-# vibe tencent 前复权链对部分基金做归一化处理（货币 ETF 净值被等比缩放），
-# 估值与建仓指导需按 IOPV 市价折算。其它标的默认 1.0（不缩放）。
-# 如果该批标的数据改源（接入东方财富 IOPV/乐咕 PV），删除本表即可。
-PRICE_SCALE = {
-    "511180.SH": 8.0,    # 银华日利：vibe 归一价 12.59 → IOPV 100.76
-}
-
 NAMES = {
     "510300.SH": "沪深300", "510500.SH": "中证500", "159915.SZ": "创业板指",
     "512010.SH": "医药", "159928.SZ": "消费", "512880.SH": "证券",
-    "512660.SH": "军工", "511010.SH": "国债ETF", "511180.SH": "银华日利",
+    "512660.SH": "军工", "511010.SH": "国债ETF", "511880.SH": "银华日利",
     "518880.SH": "黄金ETF", "159985.SZ": "豆粕ETF", "159981.SZ": "能源化工",
     "513100.SH": "纳指100", "513500.SH": "标普500", "513050.SH": "中概互联",
     "513880.SH": "日经225", "513030.SH": "德国30", "159920.SZ": "恒生ETF",
@@ -122,16 +115,15 @@ def save_nav(nav: pd.DataFrame) -> None:
 def get_last_close(code: str) -> tuple[float, str] | None:
     """最新收盘价与日期；文件缺失返回 None。
 
-    走 PRICE_SCALE 缩放（511180.SH 等货币基金按 IOPV 折算）。
-    返回的是 IOPV 市价，单位 = 元 / 份。
+    返回市价（元/份）。注：数据源 vibe tencent 前复权链对货币 ETF
+    （511880.SH 银华日利）返回真实 100 元档价格，无需缩放。
     """
     p = DATA_DIR / f"{code}.csv"
     if not p.exists():
         return None
     df = pd.read_csv(p, usecols=["date", "close"], parse_dates=["date"])
     row = df.dropna(subset=["close"]).iloc[-1]
-    scale = PRICE_SCALE.get(code, 1.0)
-    return float(row["close"]) * scale, str(row["date"].date())
+    return float(row["close"]), str(row["date"].date())
 
 
 def valuation(positions: dict[str, int]) -> tuple[dict[str, float], dict[str, str]]:

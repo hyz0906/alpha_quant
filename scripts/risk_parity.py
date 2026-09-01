@@ -33,11 +33,16 @@ ROOT = Path(__file__).resolve().parents[1]
 DATA_DIR = ROOT / "data"
 TRADING_DAYS = 252
 VOL_LOOKBACK = 60          # 波动率/协方差回看窗口（交易日）
+VOL_FLOOR_ANN = 0.025      # 波动率地板（年化）：货币腿 511880 年化波动仅 ~0.2%，
+                           # 逆波动权重 ∝ 1/vol 会把它推到 ~80% 霸占组合。
+                           # 钳到 2.5%（≈国债自然波动），货币腿与国债权重均衡，
+                           # 回到「现金管理」角色。ERC 协方差同步用地板后收益。
+                           # 注意 vol 为日频，使用时换算：VOL_FLOOR_ANN/√252。
 SHRINK = 0.2               # 协方差收缩系数（向对角收缩，改善条件数）
 
 HETERO_CODES = [
     "510300.SH", "510500.SH", "159915.SZ", "512010.SH", "159928.SZ",
-    "512880.SH", "512660.SH", "511010.SH", "511180.SH", "518880.SH",
+    "512880.SH", "512660.SH", "511010.SH", "511880.SH", "518880.SH",
     "159985.SZ", "159981.SZ", "513100.SH", "513500.SH", "513050.SH",
     "513880.SH", "513030.SH", "159920.SZ",
 ]
@@ -112,16 +117,24 @@ def erc_weights(cov: pd.DataFrame) -> np.ndarray:
 
 
 def build_weights(panel: pd.DataFrame, method: str) -> pd.DataFrame:
-    """返回与 panel 对齐的日频权重面板（t 日权重用 ≤t 的数据，t+1 应用）。"""
+    """返回与 panel 对齐的日频权重面板（t 日权重用 ≤t 的数据，t+1 应用）。
+
+    波动率地板：vol.clip(lower=VOL_FLOOR)——近零波动资产（货币 ETF 年化波动
+    ~0.2%）若不设地板，逆波动权重会给出 ~80% 的极端配比，组合退化为类现金。
+    地板设 2.5%（≈国债自然波动）后货币腿与国债权重均衡。ERC 用「地板后收益」
+    算协方差（rets × vol_f/vol），保证近零方差腿不导致数值爆炸。
+    """
     rets = panel.pct_change(fill_method=None)
     vol = rets.rolling(VOL_LOOKBACK, min_periods=int(VOL_LOOKBACK * 0.5)).std()
+    # vol 为日频，地板按年化换算
+    vol_f = vol.clip(lower=VOL_FLOOR_ANN / np.sqrt(TRADING_DAYS))
     w = pd.DataFrame(0.0, index=panel.index, columns=panel.columns)
 
     # 月末交易日列表
     month_ends = panel.index.to_series().groupby(panel.index.to_period("M")).last()
 
     for me in month_ends:
-        vol_row = vol.loc[me].dropna()
+        vol_row = vol_f.loc[me].dropna()
         if vol_row.empty:
             continue
         cols = vol_row.index
@@ -132,7 +145,12 @@ def build_weights(panel: pd.DataFrame, method: str) -> pd.DataFrame:
         elif method == "inverse_var":
             wgt = inverse_var_weights(vol_row)
         elif method == "erc":
-            trailing = rets.loc[:me, cols].iloc[-VOL_LOOKBACK:]
+            # 波动率地板后的收益：低波腿（货币/国债）被抬到地板水平再算协方差，
+            # 避免 ERC 因货币腿方差≈0 而把全部权重压给它
+            ratio = (vol_f.loc[:me, cols] / vol.loc[:me, cols].replace(0.0, np.nan))
+            ratio = ratio.fillna(1.0)
+            rets_adj = rets.loc[:me, cols] * ratio
+            trailing = rets_adj.iloc[-VOL_LOOKBACK:]
             if trailing.shape[0] < int(VOL_LOOKBACK * 0.5):
                 continue
             cov = trailing.cov()
