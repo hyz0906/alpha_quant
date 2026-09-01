@@ -11,7 +11,8 @@ AlphaQuant：个人量化**信号生成系统**——免费数据源 → 三层�
   A 股 7 腿） × QDII 溢价门控（6 只 QDII 腿）。样本内夏普 1.31 / 回撤 −5.4%
   （2020-08~2026-08，已扣 0.15% 单边成本，T→T+1 无前视）。
 - **不是自动交易系统**：不接券商账户，所有下单由人执行（`TRADING_GUIDE.md`）。
-- 每日 21:30 定时任务产出 `runs/portfolio_live.md`（明日目标持仓 + 动作清单）。
+- 每日 21:30 定时任务产出 `runs/portfolio_live.md`（明日目标持仓 + 动作清单），
+  并自动对账 20 万模拟盘（`runs/paper_trading.md`，账本 `data/paper_ledger.json`）。
 
 策略原理见 `Design.md`；系统形态见 `ARCHITECTURE.md`；使用见 `USAGE.md`；
 标的池见 `UNIVERSE.md`；人工交易见 `TRADING_GUIDE.md`；完整验证历史见
@@ -20,7 +21,8 @@ AlphaQuant：个人量化**信号生成系统**——免费数据源 → 三层�
 
 **代码库分层**（重要，改代码前先分清）：
 - **生产链**（每日在跑，改动需谨慎）：`scripts/qdii_daily.py` 编排 +
-  `qdii_monitor.py` / `qdii_backtest.py` / `portfolio_live.py`，共享库
+  `qdii_monitor.py` / `qdii_backtest.py` / `portfolio_live.py` /
+  `paper_trading.py`（模拟盘对账，第 ④ 步），共享库
   `risk_parity.py` / `qdii_relchange_realistic.py` / `qdii_relchange_backtest.py`，
   数据桥 `vibe_fetch_broker.py`，核心计算 `src/data_engine/qdii_calc.py`。
 - **研究脚本**（可复跑，非每日）：`strategy_matrix.py`（10 策略横评，新策略准入）、
@@ -52,12 +54,16 @@ AlphaQuant：个人量化**信号生成系统**——免费数据源 → 三层�
 cd ~/workspace/alpha_quant
 
 # —— 生产链 ——
-python3 scripts/qdii_daily.py                 # 每日编排：①监控→②净值刷新+回测→③组合信号
+python3 scripts/qdii_daily.py                 # 每日编排：①监控→②净值刷新+回测→③组合信号→④模拟盘对账
 python3 scripts/qdii_daily.py --skip-backtest --skip-portfolio   # 只跑监控
 python3 scripts/portfolio_live.py             # 组合信号（明日目标持仓+动作清单）→ runs/portfolio_live.md
 python3 scripts/portfolio_live.py --no-refresh# 调试：仅用本地缓存
 python3 scripts/qdii_monitor.py               # QDII 溢价快照 → runs/qdii_premium.md/.json
 python3 scripts/qdii_backtest.py --refresh    # 净值增量刷新(末日期-14天窗口)+回测 → runs/qdii_*.md
+python3 scripts/paper_trading.py entry-guide --capital 200000   # 建仓指导 → runs/paper_entry_guide.md
+python3 scripts/paper_trading.py reconcile    # 模拟盘估值+对账 → runs/paper_trading.md
+python3 scripts/paper_trading.py status       # 账本视图（现金/持仓/总资产）
+python3 scripts/paper_trading.py buy --code 511010.SH --shares 900   # 记录买入（100 整数手）
 
 # —— 研究（非每日）——
 python3 scripts/strategy_matrix.py            # 10 策略统一横评（新策略准入基准，纯本地可复跑）
@@ -74,13 +80,13 @@ python3 -m pytest tests/ -q                   # 10 passed（门控状态机/权�
 ## 4. 目录结构
 
 ```text
-scripts/            12 个脚本（生产链 11 + init_db 遗产工具，分层见 §1）+ archive/ 18 个研究归档
+scripts/            13 个脚本（生产链 12 + init_db 遗产工具，分层见 §1）+ archive/ 18 个研究归档
 src/
 ├── data_engine/    qdii_calc.py —— 生产链核心计算（影子 IOPV 溢价、relchange_zscore、池映射）
 ├── backtest/ strategies/ execution/ database/ dashboard/ analysis/ llm_agent/   # RSRS 遗产
 config/             settings.py（pydantic-settings）、logging_config.py
-data/               缓存（ETF 日线 / qdii_premium_* / legu_metrics_* / 蛋卷面板），.gitignore
-runs/               每日信号 + 研究报告（portfolio_live.md 每日必读）
+data/               缓存（ETF 日线 / qdii_premium_* / legu_metrics_* / 蛋卷面板 / 模拟盘账本+净值），.gitignore
+runs/               每日信号 + 研究报告（portfolio_live.md 每日必读；paper_trading.md 模拟盘对账）
 logs/               qdii_daily.log（定时任务日志）+ qdii_daily.err.log
 tests/              4 个测试文件（test_gates/test_rsrs/test_llm/test_db_connect）
 ```

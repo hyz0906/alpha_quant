@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """QDII 溢价套利每日定时任务编排（§7.18 / §7.20 / §9 产品化落地）。
 
-晚间（21:30）由 crontab 触发，按序执行三件事并把结果落日志：
+晚间（21:30）由 crontab 触发，按序执行四件事并把结果落日志：
 
   1. 监控快照 `qdii_monitor.py`  —— 当前截面官方/影子 IOPV 溢价告警
      -> runs/qdii_premium.md / .json
@@ -12,6 +12,9 @@
      tencent 前复权链增量）+ 乐咕 PB，按 §7.20 回测口径输出「明日目标持仓」
      与动作清单（月频再平衡 + 每日 QDII 门控刷新）
      -> runs/portfolio_live.md / .json
+  4. 模拟盘对账 `paper_trading.py reconcile` —— 20 万模拟盘按最新收盘价估值，
+     与第 3 步目标权重对账，输出偏差与调仓建议、追加当日净值
+     -> runs/paper_trading.md + data/paper_nav.csv（账本 data/paper_ledger.json）
 
 设计要点：
   * 每步用 subprocess 独立进程跑，任一步失败不影响另一步（错误隔离）。
@@ -22,8 +25,10 @@
     净值只到 T-2、亚洲腿 T-1，gate_lag_test 实测实盘夏普 1.31→~1.0）；
     21:30 时净值已补到 T-1~T（滞后降到 0~1 天）。代价：监控告警从盘中变盘后。
   * 第 3 步依赖第 2 步刚刷新的 QDII 溢价缓存，顺序不可调换。
+  * 第 4 步依赖第 3 步的 portfolio_live.json（目标权重），但缺失时只出账本
+    视图不崩溃（降级容忍）。
 
-用法：python3 scripts/qdii_daily.py [--skip-backtest] [--skip-portfolio]
+用法：python3 scripts/qdii_daily.py [--skip-backtest] [--skip-portfolio] [--skip-paper]
 """
 from __future__ import annotations
 
@@ -81,6 +86,8 @@ def main() -> int:
                         help="只跑监控快照，跳过回测刷新")
     parser.add_argument("--skip-portfolio", action="store_true",
                         help="跳过三层组合实盘信号（第 3 步）")
+    parser.add_argument("--skip-paper", action="store_true",
+                        help="跳过模拟盘对账（第 4 步）")
     args = parser.parse_args()
 
     log("=" * 72)
@@ -96,8 +103,12 @@ def main() -> int:
     if not args.skip_portfolio:
         rc3 = run_step("三层组合实盘信号", "portfolio_live.py", [])
 
-    ok = rc1 == 0 and rc2 == 0 and rc3 == 0
-    log(f"全部结束: {'全部成功' if ok else '存在失败(监控 rc=%d 回测 rc=%d 组合 rc=%d)' % (rc1, rc2, rc3)}")
+    rc4 = 0
+    if not args.skip_paper:
+        rc4 = run_step("模拟盘对账", "paper_trading.py", ["reconcile"])
+
+    ok = rc1 == 0 and rc2 == 0 and rc3 == 0 and rc4 == 0
+    log(f"全部结束: {'全部成功' if ok else '存在失败(监控 rc=%d 回测 rc=%d 组合 rc=%d 对账 rc=%d)' % (rc1, rc2, rc3, rc4)}")
     log("=" * 72)
     return 0 if ok else 1
 

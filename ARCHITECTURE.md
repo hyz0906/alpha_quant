@@ -40,18 +40,20 @@ AlphaQuant 是一个个人量化的**信号生成系统**：免费数据源 → 
 │   ① qdii_monitor.py     溢价监控快照 → runs/qdii_premium.md/.json   │
 │   ② qdii_backtest.py --refresh  净值增量刷新+回测 → runs/qdii_*.md   │
 │   ③ portfolio_live.py   三层组合明日信号 → runs/portfolio_live.md/.json│
+│   ④ paper_trading.py    模拟盘对账 → runs/paper_trading.md + 净值曲线 │
 └───────────────┬────────────────────────────────────────────────────┘
                 ▼
 ┌────────────────────────────────────────────────────────────────────┐
 │                         信号消费（人）                                │
-│  阅读 runs/portfolio_live.md → 按动作清单人工下单（TRADING_GUIDE.md）  │
+│  阅读 runs/portfolio_live.md → 按动作清单人工下单（TRADING_GUIDE.md）；│
+│  模拟盘 data/paper_ledger.json 每日自动对账（runs/paper_trading.md）  │
 └────────────────────────────────────────────────────────────────────┘
 ```
 
 ## 2. 生产链路（每日定时任务）
 
 `scripts/qdii_daily.py` 是唯一编排入口，工作日 **21:30** 由 crontab 触发，
-三步用独立子进程跑、**任一步失败不影响其余步骤**（错误隔离），日志追加到
+四步用独立子进程跑、**任一步失败不影响其余步骤**（错误隔离），日志追加到
 `logs/qdii_daily.log`：
 
 | 步骤 | 脚本 | 产出 | 失败影响 |
@@ -59,6 +61,7 @@ AlphaQuant 是一个个人量化的**信号生成系统**：免费数据源 → 
 | ① 监控快照 | `qdii_monitor.py` | `runs/qdii_premium.md/.json` | 仅告警缺失 |
 | ② 回测刷新 | `qdii_backtest.py --refresh` | `runs/qdii_backtest.md/.json` + 溢价缓存 | ③ 用旧缓存（有滞后告警） |
 | ③ 组合信号 | `portfolio_live.py` | `runs/portfolio_live.md/.json` | 当日无信号 |
+| ④ 模拟盘对账 | `paper_trading.py reconcile` | `runs/paper_trading.md` + `data/paper_nav.csv` | 缺 ③ 时仅账本视图 |
 
 **为什么 21:30**：东财晚间才更新 QDII 当日净值（15:30 时欧美腿净值只到 T-2、
 亚洲腿 T-1，实测实盘夏普 1.31→~1.0）；21:30 时净值已补到 T-1~T（滞后降到
@@ -88,10 +91,11 @@ AlphaQuant 是一个个人量化的**信号生成系统**：免费数据源 → 
 
 | 脚本 | 角色 | 说明 |
 |---|---|---|
-| `qdii_daily.py` | 编排入口 | 三步串行、错误隔离、日志 |
+| `qdii_daily.py` | 编排入口 | 四步串行、错误隔离、日志 |
 | `qdii_monitor.py` | ① 监控 | 官方/影子 IOPV 溢价 + 相对变化 z 告警 |
 | `qdii_backtest.py` | ② 刷新 | 净值增量刷新（末日期−14 天窗口）+ 溢价回避/折价买入回测 |
 | `portfolio_live.py` | ③ 信号 | 三层门控状态 + 明日目标权重 + 动作清单 |
+| `paper_trading.py` | ④ 对账 | 模拟盘账本（init/buy/sell/entry-guide/reconcile/status）|
 | `portfolio_combined.py` | 研究 | 三层组合联合回测（A/B/C/D 消融） |
 | `strategy_matrix.py` | 研究 | 10 策略统一横评（新策略准入基准） |
 | `risk_parity.py` | 共享库 | 18 只池定义、逆波动/ERC 权重、指标 |
@@ -126,7 +130,10 @@ data/fundamental/qdii_premium_<code>.csv   QDII 溢价序列（nav/acc_nav/close
 data/fundamental/legu_metrics_<code>.csv   乐咕 PE/PB（date/close/pe_ttm/pb/pb_med…）
 data/fundamental/danjuan_valuation*.csv    蛋卷估值面板（研究用）
 data/.danjuan_cookie               蛋卷登录 cookie（不入库）
+data/paper_ledger.json             模拟盘账本（现金/持仓/交易流水，原子写）
+data/paper_nav.csv                 模拟盘净值历史（date/total/cash/market/day_ret/cum_ret）
 runs/*.md /.json                   每日信号 + 研究报告
+runs/paper_trading.md              模拟盘对账报告（vs portfolio_live 目标权重）
 logs/qdii_daily.log                定时任务运行日志（+ .err.log 未捕获异常）
 ```
 

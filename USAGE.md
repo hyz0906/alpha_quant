@@ -35,20 +35,40 @@ crontab（`crontab -e` 查看/编辑）：
 - 工作日 21:30 触发，节假日空跑无害（数据无变化）
 - 日志：`logs/qdii_daily.log`（脚本内写，时间戳 + 每步成败 + 摘要）；
   未捕获异常落 `logs/qdii_daily.err.log`
-- 手动触发：`python3 scripts/qdii_daily.py [--skip-backtest] [--skip-portfolio]`
+- 手动触发：`python3 scripts/qdii_daily.py [--skip-backtest] [--skip-portfolio] [--skip-paper]`
 - 迁移机器后：crontab 中的绝对路径 `/home/hyz0906/workspace/alpha_quant` 需按实际改
 
 ## 4. 脚本用法
 
 ### 4.1 每日必跑：`scripts/qdii_daily.py`
 
-三步编排入口（21:30 自动跑，也可手动）：
+四步编排入口（21:30 自动跑，也可手动）：
 
 | 步骤 | 脚本 | 产出 |
 |---|---|---|
 | ① 监控快照 | `qdii_monitor.py` | `runs/qdii_premium.md/.json` |
 | ② 回测刷新 | `qdii_backtest.py --refresh` | `runs/qdii_backtest.md/.json` + 溢价缓存 |
 | ③ 组合信号 | `portfolio_live.py` | `runs/portfolio_live.md/.json` |
+| ④ 模拟盘对账 | `paper_trading.py reconcile` | `runs/paper_trading.md` + `data/paper_nav.csv` |
+
+### 4.1b 模拟盘：`paper_trading.py`
+
+20 万模拟盘账本（账本 `data/paper_ledger.json`，估值价 = `data/*.csv` 最新
+收盘价，佣金 0.15% 单边，与回测口径一致）：
+
+```bash
+python3 scripts/paper_trading.py entry-guide --capital 200000   # 建仓指导 → runs/paper_entry_guide.md
+python3 scripts/paper_trading.py init --capital 200000          # 初始化账本（已有需 --force 重置）
+python3 scripts/paper_trading.py buy --code 511010.SH --shares 900   # 买入（100 份整数手）
+python3 scripts/paper_trading.py sell --code 511010.SH --shares 300  # 卖出
+python3 scripts/paper_trading.py reconcile                       # 估值 + 对账（自动比对目标权重）
+python3 scripts/paper_trading.py status                          # 账本视图
+```
+
+对账报告 `runs/paper_trading.md`：实际权重 vs `portfolio_live.json` 目标权重，
+偏差 > 2pp 且金额超阈值才提示调仓（不足一手的偏差会标注「保持现金」）；
+净值历史 `data/paper_nav.csv` 每日追加。模拟盘建仓建议先跑 `entry-guide`
+拿到按整数手折算的份额表，再逐笔 `buy` 录入。
 
 ### 4.2 组合信号：`portfolio_live.py`
 
