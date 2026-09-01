@@ -13,7 +13,7 @@
 import json
 from pathlib import Path
 
-ROOT = Path("/home/hyz0906/workspace/alpha_quant")
+ROOT = Path(__file__).resolve().parents[2]  # archive 下移一层
 RUN_BASES = {
     "weekly": ROOT / "runs/sliding_pool12",
     "monthly": ROOT / "runs/sliding_pool12_monthly",

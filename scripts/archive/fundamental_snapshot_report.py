@@ -22,13 +22,14 @@ from pathlib import Path
 
 import pandas as pd
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))  # 项目根（archive 下移一层）
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # scripts/（跨脚本 import）
 
 from src.data_engine.fundamental_loader import (
     ETF_INDEX_MAP, fetch_danjuan_index_valuation,
 )
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]  # archive 下移一层
 
 
 def _fmt(x, n=2):

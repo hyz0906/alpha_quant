@@ -31,7 +31,8 @@ from datetime import datetime, timedelta
 import akshare as ak
 import pandas as pd
 
-warnings.filterwarnings("ignore")
+# 注意：不要在 import 时全局 warnings.filterwarnings("ignore")——
+# 本模块被 portfolio_live 等生产脚本导入，会静默全进程告警。需要时放 __main__。
 
 # 溢价告警阈值（绝对值，%）
 ALERT_THRESHOLD = 3.0
@@ -203,6 +204,7 @@ class QDIICalculator:
 
 
 if __name__ == "__main__":
+    warnings.filterwarnings("ignore")  # 仅独立运行时静默 akshare 噪声
     calc = QDIICalculator()
     out = calc.get_premiums()
     pd.set_option("display.width", 200)

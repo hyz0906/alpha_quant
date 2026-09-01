@@ -18,7 +18,7 @@ import pandas as pd
 
 from backtest import validation as V
 
-ROOT = Path("/home/hyz0906/workspace/alpha_quant")
+ROOT = Path(__file__).resolve().parents[2]  # archive 下移一层
 RUNS = {
     "equal_weight": ROOT / "runs/validate_pool12_equal",
     "rsrs_rotation_weekly": ROOT / "runs/validate_pool12_weekly",

@@ -24,7 +24,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-ROOT = Path(__file__).resolve().parent.parent
+ROOT = Path(__file__).resolve().parents[2]  # archive 下移一层
 sys.path.insert(0, str(ROOT / "scripts"))
 import danjuan_cross_ic as base  # 复用 mapping/returns/nw_tstat
 

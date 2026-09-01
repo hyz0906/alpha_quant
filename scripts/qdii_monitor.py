@@ -21,9 +21,9 @@ import pandas as pd
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from src.data_engine.qdii_calc import (QDIICalculator, ALERT_THRESHOLD, QDII_UNDERLYING,
-                                        RELCHANGE_WINDOW, RELCHANGE_Z)
+                                        RELCHANGE_WINDOW, RELCHANGE_Z, relchange_zscore)
 
-ROOT = Path("/home/hyz0906/workspace/alpha_quant")
+ROOT = Path(__file__).resolve().parents[1]
 
 
 def fmt(x, n=3, suffix=""):
@@ -45,21 +45,29 @@ def cache_premium(code6: str) -> pd.Series | None:
 def relchange_alert(code6: str, today_prem: float | None):
     """相对变化告警：今日溢价变动（相对昨日）在近 N 日变动分布中的 z 分数。
 
-    返回 (变动bp, z分数, 告警标签)。today_prem 为溢价分数（影子优先，官方兜底）。
+    复用 src.data_engine.qdii_calc.relchange_zscore（滚动均值/标准差滞后 1 期），
+    与回测/门控同一口径——把今日盘中溢价追加到缓存序列末尾（同日则覆盖），
+    取序列最后一个 z 值。返回 (变动bp, z分数, 告警标签)。
+    today_prem 为溢价分数（影子优先，官方兜底）。
     """
     h = cache_premium(code6)
     if h is None or today_prem is None or pd.isna(today_prem):
         return None, None, "—"
-    d_hist = h.diff().dropna()
-    if len(d_hist) < 20:
+    if len(h) < 21:
         return None, None, "数据不足"
-    mu = float(d_hist.tail(RELCHANGE_WINDOW).mean())
-    sd = float(d_hist.tail(RELCHANGE_WINDOW).std())
-    d_today = float(today_prem) - float(h.iloc[-1])
+    today_ts = pd.Timestamp(datetime.now().date())
+    if today_ts > h.index[-1]:
+        h2 = pd.concat([h, pd.Series([float(today_prem)], index=[today_ts])])
+    else:  # 缓存已含今日点（如盘后重跑）：覆盖为盘中最新值
+        h2 = h.copy()
+        h2.iloc[-1] = float(today_prem)
+    z_ser = relchange_zscore(h2, RELCHANGE_WINDOW)
+    z = z_ser.iloc[-1]
+    d_today = float(h2.iloc[-1] - h2.iloc[-2])
     bp = d_today * 1e4  # 万分之一 = 1bp
-    z = (d_today - mu) / sd if sd and sd > 0 else None
-    if z is None:
+    if pd.isna(z):
         return round(bp, 1), None, "—"
+    z = float(z)
     if z >= RELCHANGE_Z:
         return round(bp, 1), round(z, 2), "🔺 溢价飙升"
     if z <= -RELCHANGE_Z:

@@ -24,12 +24,13 @@ from pathlib import Path
 
 import pandas as pd
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))  # 项目根（archive 下移一层）
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # scripts/（跨脚本 import）
 
 from src.data_engine.qdii_calc import ALERT_THRESHOLD
 from scripts.qdii_backtest import QDII_NAMES, avoid_hold, discount_hold, _perf
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]  # archive 下移一层
 THR = ALERT_THRESHOLD  # 3.0
 
 Y2026_S, Y2026_E = "2026-01-01", "2026-12-31"

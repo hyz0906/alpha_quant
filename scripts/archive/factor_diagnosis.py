@@ -22,7 +22,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-ROOT = Path("/home/hyz0906/workspace/alpha_quant")
+ROOT = Path(__file__).resolve().parents[2]  # archive 下移一层
 DATA_DIR = ROOT / "data"
 
 CODES = [

@@ -33,7 +33,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import akshare as ak
 
-ROOT = Path("/home/hyz0906/workspace/alpha_quant")
+ROOT = Path(__file__).resolve().parents[1]
 FUND_DIR = ROOT / "data" / "fundamental"
 
 # 乐咕 index-basic-pe/pb 实测字段（2026-08）：

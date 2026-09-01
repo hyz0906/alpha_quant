@@ -3,7 +3,7 @@ import os
 import pandas as pd
 from datetime import datetime
 # Add project root to path
-sys.path.append(os.getcwd())
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))  # 项目根（archive 下移一层）
 
 from src.strategies.factors.rsrs import RSRSCalculator
 from src.strategies.signal_generator import SignalGenerator

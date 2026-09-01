@@ -72,6 +72,8 @@ NAMES = {
 
 MIN_ACTION = 0.005     # 权重变动 ≥0.5pp 才进动作清单
 STALE_DAYS = 3         # panel 末尾距今天超过 3 个自然日 → 数据滞后告警
+PREM_STALE_DAYS = 5    # 溢价缓存末日期滞后 panel 超过 5 个自然日 → 门控数据滞后告警
+                       # （净值 T+1~T+2 公布，正常滞后 ≤3 天，超过即刷新链路异常）
 
 
 # --------------------------------------------------------------------------- #
@@ -122,22 +124,35 @@ def refresh_etf_closes(codes: list[str]) -> dict[str, str]:
             merged = (pd.concat([new, old])
                       .drop_duplicates(subset="date", keep="first")
                       .sort_values("date"))
-            merged.to_csv(old_p, index=False)
-            lasts[c] = str(merged["date"].max().date())
+            # sanity check：行数/末日期不倒退才允许覆盖，且原子写防中断损坏
+            if len(merged) >= len(old) and merged["date"].max() >= old["date"].max():
+                qbt.atomic_to_csv(merged, old_p, index=False)
+                lasts[c] = str(merged["date"].max().date())
+            else:
+                print(f"[live] ⚠️ {c} 合并结果异常（行数/日期倒退），保留旧数据")
     except Exception as e:  # noqa: BLE001
         print(f"[live] ⚠️ 收盘价刷新异常 {type(e).__name__}: {e}，用旧数据继续")
     return lasts
 
 
 def refresh_legu() -> str:
-    """乐咕沪深300 月频估值缓存：未覆盖本月时重拉（覆盖写，schema 与
-    value_timing_backtest.load_metrics 一致）。失败降级用缓存。返回最新日期。"""
+    """乐咕沪深300 月频估值缓存：未覆盖本月时重拉（原子覆盖写，schema 与
+    value_timing_backtest.load_metrics 一致）。失败降级用缓存。返回最新日期。
+
+    缓存缺失/损坏（FileNotFoundError、空文件、解析失败）不崩溃，按全量重拉处理；
+    重拉也失败且无缓存可用时返回 "—"，由调用方决定 PB 门控降级。
+    """
     cache = FUND_DIR / f"legu_metrics_{pc.PB_GATE_SOURCE}.csv"
-    m = pd.read_csv(cache, parse_dates=["date"]).set_index("date").sort_index()
+    m = pd.DataFrame()
+    try:
+        m = pd.read_csv(cache, parse_dates=["date"]).set_index("date").sort_index()
+    except Exception as e:  # noqa: BLE001
+        print(f"[live] ⚠️ 乐咕缓存读取失败 {type(e).__name__}: {e}，按全量重拉处理")
     today = pd.Timestamp(datetime.now().date())
-    if m.index.max() >= pd.Timestamp(today.year, today.month, 1):
+    if not m.empty and m.index.max() >= pd.Timestamp(today.year, today.month, 1):
         return str(m.index.max().date())
-    print(f"[live] 乐咕 PB 缓存截至 {m.index.max().date()}，重拉...")
+    last_cached = str(m.index.max().date()) if not m.empty else "无缓存"
+    print(f"[live] 乐咕 PB 缓存截至 {last_cached}，重拉...")
     try:
         import akshare as ak
         pe = ak.stock_index_pe_lg(symbol="沪深300").rename(columns={
@@ -156,14 +171,14 @@ def refresh_legu() -> str:
             if c in df.columns:
                 df[c] = pd.to_numeric(df[c], errors="coerce")
         df = df.dropna(subset=["close"]).sort_index()
-        if len(df) > len(m):
-            df.to_csv(cache)
+        if not df.empty and len(df) > len(m):
+            qbt.atomic_to_csv(df, cache)
             print(f"[live] 乐咕缓存更新至 {df.index.max().date()}")
             return str(df.index.max().date())
         print("[live] 乐咕暂无新数据，沿用缓存")
     except Exception as e:  # noqa: BLE001
         print(f"[live] ⚠️ 乐咕重拉失败 {type(e).__name__}: {e}，用缓存")
-    return str(m.index.max().date())
+    return last_cached
 
 
 # --------------------------------------------------------------------------- #
@@ -245,14 +260,21 @@ def main(refresh: bool = True) -> int:
     w_iv = rp.build_weights(panel, "inverse_vol").iloc[-1]
 
     # ---- 2. PB 门控（shift(1) 语义 = 回测原样口径）----
-    g = pc.pb_gate_monthly("triple")
-    pb_next = float(g.shift(1).dropna().iloc[-1])
-    m = pd.read_csv(FUND_DIR / f"legu_metrics_{pc.PB_GATE_SOURCE}.csv",
-                    parse_dates=["date"]).set_index("date").sort_index()
-    pct = pc.rolling_pct(m["pb"])
-    pct_now = float(pct.dropna().iloc[-1])
-    pct_month = str(m.index.max().date())
-    legu_last = pct_month if refresh or legu_last == "（未刷新）" else legu_last
+    # 乐咕缓存不可用时降级：档位取全仓并在报告显著标注（宁可告警，不可崩溃）
+    pb_ok = True
+    try:
+        g = pc.pb_gate_monthly("triple")
+        pb_next = float(g.shift(1).dropna().iloc[-1])
+        m = pd.read_csv(FUND_DIR / f"legu_metrics_{pc.PB_GATE_SOURCE}.csv",
+                        parse_dates=["date"]).set_index("date").sort_index()
+        pct = pc.rolling_pct(m["pb"])
+        pct_now = float(pct.dropna().iloc[-1])
+        pct_month = str(m.index.max().date())
+    except Exception as e:  # noqa: BLE001
+        print(f"[live] ⚠️ PB 门控数据不可用 {type(e).__name__}: {e}，档位降级为全仓")
+        pb_ok = False
+        pb_next, pct_now, pct_month = 1.0, None, "—"
+    legu_last = pct_month if (refresh or legu_last == "（未刷新）") and pb_ok else legu_last
 
     # ---- 月末判定（今日为本月最后交易日 → 明日执行月度再平衡）----
     month_ends = panel.index.to_series().groupby(panel.index.to_period("M")).last()
@@ -261,6 +283,12 @@ def main(refresh: bool = True) -> int:
     # ---- 3. QDII 门控（明日）----
     qdii = {c: qdii_gate_next(c) for c in pc.QDII_LEGS}
     prem_max = max((v["prem_last"] or "" for v in qdii.values()), default="")
+    # 溢价缓存滞后检查：净值 T+1~T+2 公布属正常（≤3 天），超过阈值说明
+    # 第 2 步刷新链路异常（如数据源断更/接口变更），门控信号可信度下降
+    prem_stale = {
+        c: v["prem_last"] for c, v in qdii.items()
+        if v["prem_last"] and (as_of - pd.Timestamp(v["prem_last"])).days > PREM_STALE_DAYS
+    }
 
     # ---- 明日目标权重 ----
     target: dict[str, float] = {}
@@ -311,10 +339,11 @@ def main(refresh: bool = True) -> int:
             "legu_pb_last": legu_last,
             "qdii_premium_last": {c: v["prem_last"] for c, v in qdii.items()},
             "panel_stale": bool(data_stale),
+            "qdii_premium_stale": prem_stale,
         },
         "is_month_end": is_month_end,
-        "pb": {"percentile": round(pct_now, 4), "level": pb_next,
-               "pct_month": pct_month},
+        "pb": {"percentile": round(pct_now, 4) if pct_now is not None else None,
+               "level": pb_next, "pct_month": pct_month, "degraded": not pb_ok},
         "invvol_weights": {c: round(float(w_iv.get(c, 0.0)), 4) for c in panel.columns},
         "qdii_gates": qdii,
         "target_weights": {c: round(w, 4) for c, w in target.items()},
@@ -326,8 +355,11 @@ def main(refresh: bool = True) -> int:
                    "min_hold_days": 5, "z_hi": 2.0, "vol_lookback": rp.VOL_LOOKBACK},
     }
     RUNS.mkdir(exist_ok=True)
-    LIVE_JSON.write_text(json.dumps(snap, ensure_ascii=False, indent=2),
-                         encoding="utf-8")
+    # 原子写：先写临时文件再替换，避免中断留下半个 JSON 污染次日对比基准
+    tmp_json = LIVE_JSON.with_suffix(".json.tmp")
+    tmp_json.write_text(json.dumps(snap, ensure_ascii=False, indent=2),
+                        encoding="utf-8")
+    tmp_json.replace(LIVE_JSON)
 
     # ---- Markdown 报告 ----
     L = [f"# 三层组合实盘信号（{as_of.date()} 收盘后）\n",
@@ -343,10 +375,18 @@ def main(refresh: bool = True) -> int:
     if data_stale:
         L.append(f"> ⚠️ **ETF 数据滞后**：panel 末尾为 {as_of.date()}（距今 "
                  f"{(today - as_of).days} 天），月末判定与再平衡宣告可能失真。\n")
+    if prem_stale:
+        legs = "、".join(f"{NAMES.get(c, c)}(截至 {d})" for c, d in prem_stale.items())
+        L.append(f"> ⚠️ **QDII 溢价缓存滞后超 {PREM_STALE_DAYS} 天**：{legs}——"
+                 "第 2 步刷新链路可能异常，相关门控信号可信度下降，请检查日志。\n")
+    if not pb_ok:
+        L.append("> ⚠️ **PB 门控数据不可用**：乐咕缓存读取失败，本次 A 股腿档位"
+                 "降级为全仓（1.0），请尽快修复数据源。\n")
 
     L.append("## 1. 三层门控状态\n")
+    pct_str = f"{pct_now:.0%}" if pct_now is not None else "—（数据不可用）"
     L.append(f"- **PB 门控**（沪深300 PB 5 年滚动分位，{pct_month}）：当前分位 "
-             f"**{pct_now:.0%}** → 明日档位 **{_fmt_gate(pb_next)}**"
+             f"**{pct_str}** → 明日档位 **{_fmt_gate(pb_next)}**"
              f"（<30% 全仓 / 30~70% 半仓 / ≥70% 空仓）")
     qd_flips = [c for c in pc.QDII_LEGS
                 if qdii[c]["today"] != qdii[c]["tomorrow"]]
@@ -408,7 +448,11 @@ def main(refresh: bool = True) -> int:
     print(f"三层组合实盘信号（ETF 截至 {etf_max}，PB {legu_last}，溢价 {prem_max}）")
     print(f"  再平衡：{'明日执行月度再平衡（今日为月末）' if is_month_end else '非再平衡日'}"
           + ("（⚠️ 数据滞后，判定可能失真）" if data_stale else ""))
-    print(f"  PB 门控：沪深300 PB 分位 {pct_now:.0%} → A 股腿档位 {_fmt_gate(pb_next)}")
+    print(f"  PB 门控：沪深300 PB 分位 {pct_str} → A 股腿档位 {_fmt_gate(pb_next)}"
+          + ("（⚠️ 降级全仓）" if not pb_ok else ""))
+    if prem_stale:
+        print(f"  ⚠️ QDII 溢价缓存滞后超 {PREM_STALE_DAYS} 天："
+              + "、".join(prem_stale.keys()))
     if qd_flips:
         for c in qd_flips:
             v = qdii[c]

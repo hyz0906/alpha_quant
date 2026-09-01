@@ -39,7 +39,7 @@ from pathlib import Path
 
 import pandas as pd
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]  # archive 下移一层
 FUND_DIR = ROOT / "data" / "fundamental"
 OUT_CSV = FUND_DIR / "danjuan_valuation_panel.csv"
 OUT_META = FUND_DIR / "danjuan_valuation_panel.json"

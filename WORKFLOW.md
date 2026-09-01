@@ -454,7 +454,7 @@ vibe 子进程（broker、runner）均以 **cwd=$HOME** 运行，此时 `import 
 针对 §7.7 结论 5 的「降频压换手」方向，新增 `rsrs_rotation_monthly` 模板
 （周频模板派生，仅 `to_period("W")→"M"`），在 12 只池上重跑 13 窗滑动窗口
 （`runs/sliding_pool12_monthly/`），并与周频做逐窗成本归因
-（`scripts/compare_cost.py`）。
+（`scripts/archive/compare_cost.py`）。
 
 **换手成本对比（13 窗累计，每窗 10 万本金独立）**：
 
@@ -485,7 +485,7 @@ vibe 子进程（broker、runner）均以 **cwd=$HOME** 运行，此时 `import 
 ### 7.9 因子有效性诊断（截面 IC + 分层收益，定位失效根因）
 
 针对 §7.8「信号 alpha 本身不足」的结论，用标准因子检验定位根因
-（`scripts/factor_diagnosis.py`，扩展池 12 只、共同样本 2017-09 起、2700+ 观测）：
+（`scripts/archive/factor_diagnosis.py`，扩展池 12 只、共同样本 2017-09 起、2700+ 观测）：
 
 **截面 IC（Spearman rank IC，RSRS 修正分 vs 未来 k 日收益）**：
 
@@ -520,7 +520,7 @@ vibe 子进程（broker、runner）均以 **cwd=$HOME** 运行，此时 `import 
 
 为回答 §9「换新因子」，新增因子库 `src/strategies/factors/factor_library.py`
 （动量/波动/趋势/量价/风险调整 5 族 16 因子）与批量筛选脚本
-`scripts/factor_screening.py`，在扩展池 12 只上跑与 §7.9 相同的截面
+`scripts/archive/factor_screening.py`，在扩展池 12 只上跑与 §7.9 相同的截面
 IC + ICIR + 分层收益三件套（向量化实现，16 因子 × 3 视界 × 120 相关对
 约 3 秒跑完）。判定门槛：强通过 |ICIR|≥0.5、弱通过 |ICIR|≥0.3，且正 IC
 占比须落在 [45%,55%] 之外。
@@ -600,8 +600,8 @@ IC + ICIR + 分层收益三件套（向量化实现，16 因子 × 3 视界 × 1
 ### 7.12 时序择时 + 大类资产轮动（修正前视偏差后，时序路线也证伪）
 
 §7.11 收口时把「时序择时/轮动」列为价量维度最后的 alpha 希望。用两个新脚本
-在 18 只异构池上检验：`scripts/timing_diagnosis.py`（趋势跟踪，多/空现金）与
-`scripts/rotation_test.py`（股/债/金动量轮动）。
+在 18 只异构池上检验：`scripts/archive/timing_diagnosis.py`（趋势跟踪，多/空现金）与
+`scripts/archive/rotation_test.py`（股/债/金动量轮动）。
 
 **1. 趋势跟踪多/空现金（timing_diagnosis.py）——无 alpha**：mom_60/120/240、
 ma_200、ma_50_200 五种趋势信号，>0 做多、否则空仓现金，逐标的对比 buy-hold。
@@ -640,7 +640,7 @@ mom4_egbn 到 1.64（年化 +32.86%），一度误判「轮动是唯一正 alpha
 ### 7.13 基本面/估值因子（carry/value）——快照诊断 + 数据覆盖局限
 
 §9 第一项（跳出价量维度）。新增 `src/data_engine/fundamental_loader.py` +
-`src/strategies/factors/fundamental_factors.py` + `scripts/fundamental_screening.py`，
+`src/strategies/factors/fundamental_factors.py` + `scripts/archive/fundamental_screening.py`，
 用 akshare 免费数据抓估值快照做截面 carry/value 诊断。
 
 **数据源与覆盖（实测）**：中证指数官方 `stock_zh_index_value_csindex` 给最新
@@ -733,7 +733,7 @@ ConnectionError，代码已优雅降级退回官方口径。④（精细版，�
 仅 3 宽基（上证50/沪深300/中证500）但月频**完整历史（2005 至今）**——上一轮
 「近 1 年」的注释是错的，已修正。
 
-**时序估值择时替代检验**（`scripts/fundamental_timing.py`，滚动 5 年 PE 分位 →
+**时序估值择时替代检验**（`scripts/archive/fundamental_timing.py`，滚动 5 年 PE 分位 →
 未来 12 月收益）：
 
 | 宽基 | Q1便宜 | Q5贵 | 多空Q1-Q5 | 单调递减 | 分段多空(13-17/18-22/23-27) |
@@ -764,7 +764,7 @@ Series，RangeIndex 与日期索引对齐失败 → 全 NaN（须 `.to_numpy()` 
 覆盖广一个量级，替代它做截面估值排名。
 
 已封装 `fetch_danjuan_index_valuation()`（`fundamental_loader.py`）+ 报告脚本
-`scripts/fundamental_snapshot_report.py`，输出 `runs/fundamental_snapshot.md`
+`scripts/archive/fundamental_snapshot_report.py`，输出 `runs/fundamental_snapshot.md`
 / `.json` + `data/fundamental/danjuan_valuation.csv`。
 
 **关键发现**（2026-08-28 截面）：
@@ -824,7 +824,7 @@ Series，RangeIndex 与日期索引对齐失败 → 全 NaN（须 `.to_numpy()` 
   `cd ~/workspace/alpha_quant && /usr/bin/python3 scripts/qdii_daily.py`。
 - 手动等价命令：`python3 scripts/qdii_daily.py`（或 `--skip-backtest` 只跑监控）。
 
-**E. 2026 年专项补记（信号反转，`scripts/qdii_2026_analysis.py`）**
+**E. 2026 年专项补记（信号反转，`scripts/archive/qdii_2026_analysis.py`）**
 
 单独看 2026 单年（01-05 ~ 08-28，8 个月），暴露了与全样本结论相反的结构变化——
 **高溢价从「脉冲式恐慌」变成了「额度告罄的结构性常态」，3% 绝对阈值在纳指/标普/
@@ -1042,7 +1042,7 @@ QDII 门控 > PB 调档 > 月度再平衡 > 波动率漂移。诚实边界：输
 ### 7.22 QDII 门控降频实验（日频 vs 周频，假设被推翻，维持日频）
 
 §7.20 §5 发现 QDII 门控贡献组合 60% 换手、单次仅动 ~4% 资金，提出「降频到
-周频可再压一半换手而几乎不损超额」的假设。`scripts/qdii_gate_weekly_test.py`
+周频可再压一半换手而几乎不损超额」的假设。`scripts/archive/qdii_gate_weekly_test.py`
 验证（报告 `runs/qdii_gate_weekly.md`）：周频口径 = 每周首个交易日取日频门控
 值（该值已由上周五信息决定，无靠前）整周 ffill，即「周五决策、周一执行、
 周内不动」。
@@ -1130,8 +1130,8 @@ ETF 存在显著溢价**（§7.18），用 ETF 二级价格算收益会混入溢
 （增量更新需重新导出）；⑤ 最新期 62 指数中仅 **51 个有场内 ETF 代码**，
 其余只能走场外或不可交易。
 
-**产物**：`scripts/danjuan_panel_fetch.py`（抓取，断点续传 + 8 并发）、
-`scripts/danjuan_panel_split.py`（两表拆分 + 交叉验证）、
+**产物**：`scripts/archive/danjuan_panel_fetch.py`（抓取，断点续传 + 8 并发）、
+`scripts/archive/danjuan_panel_split.py`（两表拆分 + 交叉验证）、
 `data/fundamental/danjuan_valuation_lsd.csv`（干净面板 63549 行）、
 `runs/danjuan_panel_report.md`（体检报告）。
 
@@ -1179,14 +1179,14 @@ ICIR 改用 21 日非重叠采样口径。
 
 **问题**：截面 IC 体系（§7.23~7.24）能否与三层组合（§7.20）结合？
 
-**第一步：动量方向反查**（`scripts/danjuan_momentum_ic.py`，51 ETF 面板）。
+**第一步：动量方向反查**（`scripts/archive/danjuan_momentum_ic.py`，51 ETF 面板）。
 价值反偏即动量信号，实测确为**长周期动量**：mom12_1（250 日跳 20 日）对
 120d 前瞻 IC=+0.150、NW-t=+1.82，mom250 同向（+0.142/+1.84）；短周期
 mom20/60 无效（IC≈0 甚至为负）。分年看 mom12_1 在 2022~2026 连续五年为正
 （2020/2021 为负）。五分位分层多空年化 +3.6~5.1%——**方向对、但 NW-t 未过
 2.0，不够格做独立第四层**。
 
-**第二步：温和倾斜层实测**（`scripts/portfolio_momentum_tilt.py`）。
+**第二步：温和倾斜层实测**（`scripts/archive/portfolio_momentum_tilt.py`）。
 D 档三层全开 + 月频 mom12_1 组内倾斜（A股/QDII/商品三组，z 分限幅 ±1.5，
 组内归一不改敞口，与 ERC 同节奏不新增调仓事件）：
 

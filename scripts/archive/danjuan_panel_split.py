@@ -20,7 +20,7 @@ from pathlib import Path
 
 import pandas as pd
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]  # archive 下移一层
 FUND = ROOT / "data" / "fundamental"
 CSV = FUND / "danjuan_valuation_panel.csv"
 CSV_LSD = FUND / "danjuan_valuation_lsd.csv"

@@ -29,7 +29,7 @@ from scipy.optimize import minimize
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-ROOT = Path("/home/hyz0906/workspace/alpha_quant")
+ROOT = Path(__file__).resolve().parents[1]
 DATA_DIR = ROOT / "data"
 TRADING_DAYS = 252
 VOL_LOOKBACK = 60          # 波动率/协方差回看窗口（交易日）

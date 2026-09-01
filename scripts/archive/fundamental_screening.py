@@ -23,7 +23,8 @@ from pathlib import Path
 
 import pandas as pd
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))  # 项目根（archive 下移一层）
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # scripts/（跨脚本 import）
 
 from src.data_engine.fundamental_loader import (
     ETF_INDEX_MAP, NON_EQUITY_NOTE, fetch_bond_yield_10y, fetch_valuation_snapshot,
@@ -32,7 +33,7 @@ from src.strategies.factors.fundamental_factors import (
     earnings_yield, equity_risk_premium,
 )
 
-ROOT = Path("/home/hyz0906/workspace/alpha_quant")
+ROOT = Path(__file__).resolve().parents[2]  # archive 下移一层
 
 
 def main():

@@ -25,11 +25,12 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))  # 项目根（archive 下移一层）
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # scripts/（跨脚本 import）
 
 from src.data_engine.fundamental_loader import LEGU_BROAD_INDEXES, fetch_lg_monthly
 
-ROOT = Path("/home/hyz0906/workspace/alpha_quant")
+ROOT = Path(__file__).resolve().parents[2]  # archive 下移一层
 FUND_DIR = ROOT / "data" / "fundamental"
 
 FWD_MONTHS = 12          # 未来收益视界（估值是慢变量，用长视界）

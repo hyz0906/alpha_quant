@@ -1,16 +1,19 @@
-pandas
-numpy
-scipy
-sqlalchemy
-redis
-tushare
-akshare
-backtrader
-openai
-loguru
-pydantic-settings
-pymupdf4llm
-streamlit
-plotly
-altair
-requests
+# AlphaQuant 生产依赖（安装以此文件为准；pyproject.toml 为打包元数据镜像）
+# 版本钉死 = WSL 生产环境实测版本（2026-09 校验）
+pandas==2.3.3
+numpy==2.4.6
+scipy==1.18.0
+akshare==1.18.94
+sqlalchemy==2.0.51
+pydantic==2.12.3
+pydantic-settings==2.14.2
+openai==3.6.0
+loguru==0.7.3
+requests==2.32.5
+tushare==1.4.29
+
+# ---- legacy 模块可选依赖（src/backtest、streamlit 仪表盘等已下线功能，按需安装）----
+# redis
+# backtrader
+# streamlit
+# pymupdf4llm

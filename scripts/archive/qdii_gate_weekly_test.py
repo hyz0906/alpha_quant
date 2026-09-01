@@ -27,13 +27,14 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))  # 项目根（archive 下移一层）
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # scripts/（跨脚本 import）
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import risk_parity as rp
 import portfolio_combined as pc
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]  # archive 下移一层
 COST = pc.COST
 
 
