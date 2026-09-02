@@ -38,6 +38,24 @@ crontab（`crontab -e` 查看/编辑）：
 - 手动触发：`python3 scripts/qdii_daily.py [--skip-backtest] [--skip-portfolio] [--skip-paper]`
 - 迁移机器后：crontab 中的绝对路径 `/home/hyz0906/workspace/alpha_quant` 需按实际改
 
+### 3b. WorkBuddy 定时任务：每日 22:00 复盘（次日调仓建议）
+
+在 WorkBuddy 内建的 automation（非 crontab），**每天 22:00** 触发：
+
+| 时间 | 执行者 | 做什么 |
+|---|---|---|
+| 21:30 | crontab `qdii_daily.py` | 跑数据生成（溢价快照 / 回测 / 信号 / 对账四步） |
+| 22:00 | WorkBuddy automation | 读上述产出物 → `daily_advice.py` → 输出次日调仓建议并推送给用户 |
+
+分工理由：21:30 是数据生成（必须联网拉行情，放在 WSL cron 里稳定）；
+22:00 是**分析与决策**（整数手最优求解 + 自然语言解读），放在 WorkBuddy 里
+便于直接把建议推给用户。两者解耦，22:00 任务会先检查 21:30 数据是否为今天，
+不是则自动补跑（覆盖 WSL 未启动 / Windows 重启 / cron 漏跑的情况）。
+
+- 查看与调整：WorkBuddy 客户端 → 自动化任务 →「AlphaQuant 每日调仓建议（22:00）」
+- 手动触发：直接跑 `python3 scripts/daily_advice.py`（见 §4.1c）
+- ⚠️ 依赖 Windows 侧 WorkBuddy 在运行；WSL 的 21:30 cron 不依赖它，两者独立
+
 ## 4. 脚本用法
 
 ### 4.1 每日必跑：`scripts/qdii_daily.py`
@@ -69,6 +87,29 @@ python3 scripts/paper_trading.py status                          # 账本视图
 偏差 > 2pp 且金额超阈值才提示调仓（不足一手的偏差会标注「保持现金」）；
 净值历史 `data/paper_nav.csv` 每日追加。模拟盘建仓建议先跑 `entry-guide`
 拿到按整数手折算的份额表，再逐笔 `buy` 录入。
+
+### 4.1c 每日复盘与调仓建议：`scripts/daily_advice.py`
+
+汇总 21:30 的四类产出物，输出**次日可下单的调仓指令**：
+
+```bash
+python3 scripts/daily_advice.py                    # 数据日期取 portfolio_live.json 的 as_of
+python3 scripts/daily_advice.py --as-of 2026-09-01  # 指定数据日期
+python3 scripts/daily_advice.py --min-dev 0.02      # 调仓触发阈值（默认 2pp）
+```
+
+→ `runs/daily_advice_<数据日期>.md`，含 8 节：一句话结论 / 数据健康 / 溢价快照 /
+组合信号 / 套利回测 / 模拟盘对账 / **明日调仓指令** / 风险提示。
+
+**核心是整数手最优求解**。目标函数 = Σ|执行后占比 − 目标占比| + |现金占比 −
+目标现金占比|，约束 100 份整手、0.15% 佣金、现金不可为负，用枚举搜索求全局最优
+（每腿只搜「理想手数 ±4 手」，总组合超 30 万自动收紧）。
+
+> ⚠️ 为什么不用 `paper_trading.py reconcile` 自带的建议：它对卖出腿与买入腿
+> **分别向下取整**，两边同时 floor 导致「卖出回款 > 买入支出」，多余现金溢出。
+> 2026-09-01 实测：原建议（卖 400 / 买 400）偏离 28.3pp、现金被抬到 24.1%；
+> 全局最优（卖 400 / 买 500）偏离 **21.3pp**、现金 19.1%。调仓建议一律以
+> `daily_advice.py` 为准。
 
 ### 4.2 组合信号：`portfolio_live.py`
 
