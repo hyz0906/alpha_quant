@@ -80,6 +80,17 @@ try:  # 腿分类复用 portfolio_combined（与 portfolio_live 同一事实源�
 except Exception:  # noqa: BLE001  降级：不区分腿（仅影响报告里腿标注）
     A_STOCK_LEGS, QDII_LEGS = [], []
 
+# 整数手调仓求解器：与 daily_advice.py 共用同一实现。
+# 2026-09-02 起 reconcile 的建议列改走这里，替代原先「买卖腿分别向下取整」
+# 的次优逻辑（实测偏离 28.33pp vs 全局最优 21.34pp，且会让现金非预期溢出）。
+try:
+    from rebalance_solver import LOT as _SOLVER_LOT, solve_lots as _solve_lots
+    SOLVER_OK = True
+    assert _SOLVER_LOT == LOT, "rebalance_solver 与本地 LOT 不一致"
+except Exception:  # noqa: BLE001  降级：退回逐腿 floor（不应发生，仅兜底）
+    _solve_lots = None
+    SOLVER_OK = False
+
 
 # --------------------------------------------------------------------------- #
 # 账本读写（原子写，防中断损坏）
@@ -399,6 +410,7 @@ def cmd_reconcile() -> int:
         print("⚠️ 账本不存在，请先 init（或先跑 entry-guide 生成建仓指令）。")
         return 1
     snap = load_target()
+    sol = None          # 整数手求解结果（snap 为 None 时保持 None）
 
     positions = led.get("positions", {})
     market, last_dates = valuation(positions)
@@ -408,8 +420,18 @@ def cmd_reconcile() -> int:
     day = datetime.now().strftime("%Y-%m-%d")
 
     # 净值历史（同日去重）
+    # 注意：必须真的去重——同一天多次跑 reconcile（调仓后重跑、手动补跑）
+    # 若直接追加会累积重复行，prev_total 取到同日旧值导致 day_ret 失真。
     nav = load_nav()
-    prev_total = None if nav.empty else float(nav.iloc[-1]["total"])
+    if not nav.empty:
+        nav = nav.copy()
+        nav["date"] = pd.to_datetime(nav["date"])
+        same_day = nav["date"] == pd.Timestamp(day)
+        if same_day.any():
+            nav = nav[~same_day]              # 剔除当日旧行，稍后以新值覆盖
+        prev_total = None if nav.empty else float(nav.iloc[-1]["total"])
+    else:
+        prev_total = None
     day_ret = (total / prev_total - 1) if prev_total else None
     cum_ret = total / float(led["capital"]) - 1
     row = pd.DataFrame([{
@@ -453,30 +475,63 @@ def cmd_reconcile() -> int:
     else:
         tw = snap.get("target_weights", {})
         cash_target = snap.get("cash", 0.0)
+        codes = sorted(set(list(tw.keys()) + list(positions.keys())),
+                       key=lambda x: -float(tw.get(x, 0.0)))
+
+        # ---- 整数手最优求解（与 daily_advice.py 共用 rebalance_solver）----
+        # 替代原先「各腿独立 floor 取整」：那会让卖出回款 > 买入支出、现金溢出，
+        # 实测偏离 28.33pp vs 全局最优 21.34pp。
+        px_all: dict[str, float] = {}
+        for c in codes:
+            v = get_last_close(c)
+            if v and v[0] > 0:
+                px_all[c] = float(v[0])
+        sol = None
+        if SOLVER_OK and px_all:
+            try:
+                sol = _solve_lots(
+                    positions={c: int(positions.get(c, 0)) for c in px_all},
+                    prices=px_all,
+                    targets={c: float(tw.get(c, 0.0)) for c in px_all},
+                    total=total, cash=cash,
+                    target_cash=float(cash_target or 0.0),
+                    min_dev=W_DIFF_TH,
+                )
+            except Exception:  # noqa: BLE001  求解失败不应阻断对账
+                sol = None
+        plan: dict[str, tuple[str, int]] = {}     # code -> (方向, 份数)
+        if sol:
+            for c, sh in sol["sells"].items():
+                plan[c] = ("卖出", int(sh))
+            for c, sh in sol["buys"].items():
+                plan[c] = ("买入", int(sh))
+
         L.append("| 代码 | 名称 | 目标权重 | 目标金额 | 实际金额 | 偏差金额 | 偏差pp | 建议 |")
         L.append("|---|---|---|---|---|---|---|---|")
         suggestions, sub_lot = [], []
         th = max(MIN_AMT_TH, total * W_DIFF_TH)
-        for c in sorted(set(list(tw.keys()) + list(positions.keys())),
-                        key=lambda x: -float(tw.get(x, 0.0))):
+        for c in codes:
             w_t = float(tw.get(c, 0.0))
             amt_t = total * w_t
             amt_a = float(market.get(c, 0.0))
             diff = amt_a - amt_t
             diff_pp = diff / total * 100 if total else 0.0
             act = ""
-            if abs(diff) > th and abs(diff_pp) > W_DIFF_TH * 100:
-                v = get_last_close(c)
-                px = v[0] if v else None
-                if px:
-                    n_sh = int(abs(diff) / px / LOT) * LOT
-                    if n_sh >= LOT:
-                        act = f"{'卖出' if diff > 0 else '买入'} ≈{n_sh} 份"
-                        suggestions.append((c, NAMES.get(c, c), diff, n_sh))
-                    else:
-                        # 偏差金额超阈值但不足一手：标注但不建议执行（硬凑一手会反向超配）
-                        act = f"{'卖出' if diff > 0 else '买入'}不足一手"
+            if c in plan:
+                side, n_sh = plan[c]
+                act = f"**{side} {n_sh} 份**"
+                suggestions.append((c, NAMES.get(c, c), diff, n_sh, side))
+            else:
+                over = abs(diff) > th and abs(diff_pp) > W_DIFF_TH * 100
+                if over:
+                    v = get_last_close(c)
+                    px = v[0] if v else None
+                    if px and abs(diff) / px < LOT:
+                        # 偏差金额超阈值但不足一手：凑一手会反向超配，求解器自然排除
+                        act = "不动（不足一手）"
                         sub_lot.append((c, NAMES.get(c, c), diff))
+                    elif sol is not None:
+                        act = "不动（调后总偏离变大）"
             if w_t < 0.0005 and diff_pp == 0 and act == "":
                 continue
             L.append(f"| {c} | {NAMES.get(c, c)} | {w_t*100:.1f}% | {amt_t:,.0f} "
@@ -485,16 +540,36 @@ def cmd_reconcile() -> int:
         cdiff = cash_a - cash_t
         L.append(f"| — | **现金** | {cash_target*100:.1f}% | {cash_t:,.0f} "
                  f"| {cash_a:,.0f} | {cdiff:+,.0f} | {cdiff/total*100:+.1f}pp | — |")
-        L.append("\n### 调仓建议\n")
+        L.append("\n### 调仓建议（整数手全局最优）\n")
+        if sol is not None:
+            L.append(f"> 求解器枚举搜索：总绝对偏离 {sol['before_abs_dev']:.1f}pp → "
+                     f"**{sol['total_abs_dev']:.1f}pp**"
+                     + (f"（改善 {sol['before_abs_dev']-sol['total_abs_dev']:.1f}pp）"
+                        if sol["before_abs_dev"] - sol["total_abs_dev"] > 0.05
+                        else "（当前持仓已是最优，不调仓）") + "\n")
         if suggestions:
-            for c, name, diff, n_sh in suggestions:
-                L.append(f"- **{name}（{c}）**：{'超配' if diff > 0 else '低配'} "
-                         f"{abs(diff):,.0f} 元 → {'卖出' if diff > 0 else '买入'} "
-                         f"约 {n_sh} 份（100 股整数手，具体以实时价为准）")
-            L.append("\n> 执行后重跑本脚本刷新对账；调仓建议含整数手近似，"
-                     "实际成交价以当日行情为准。")
+            for c, name, diff, n_sh, side in suggestions:
+                px = px_all.get(c, 0.0)
+                L.append(f"- **{side} {name}（{c}）{n_sh} 份** ≈ {n_sh*px:,.0f} 元"
+                         f"（现价 {px:.3f}；当前{'超配' if diff > 0 else '低配'} "
+                         f"{abs(diff):,.0f} 元）")
+            if sol:
+                L.append(f"\n> 卖出回款（扣佣金）≈ {sol['proceeds']:,.0f} 元 ｜ "
+                         f"买入支出（含佣金）≈ {sol['spend']:,.0f} 元 ｜ "
+                         f"现金 {cash:,.0f} → {sol['cash_after']:,.0f} 元"
+                         f"（{cash/total*100:.1f}% → {sol['cash_after']/total*100:.1f}%）")
+            L.append("\n> 与 `scripts/daily_advice.py` 共用 `rebalance_solver.py`，"
+                     "两入口结果一致；执行后重跑本脚本刷新对账。")
         else:
-            L.append("无超阈值偏差，**无需调仓**。")
+            why = []
+            if sub_lot:
+                why.append("超阈值腿均不足一手（凑一手会反向超配）")
+            has_blocked = any("调后总偏离变大" in x for x in L)
+            if has_blocked:
+                why.append("其余超阈值腿调整后总偏离反而变大")
+            L.append("求解器判定**无需调仓**"
+                     + ("：" + "；".join(why) + "，" if why else "（无超阈值偏差），")
+                     + "当前持仓已是整数手约束下的最优解。")
         if sub_lot:
             L.append("\n> ⚠️ 以下腿偏差超阈值但**不足一手**（硬凑一手会反向超配）："
                      + "、".join(f"{name}（{c}，{'超配' if d > 0 else '低配'} "
@@ -535,8 +610,14 @@ def cmd_reconcile() -> int:
           f"（累计 {cum_ret*100:+.2f}%"
           + (f"，当日 {day_ret*100:+.2f}%）" if day_ret is not None else "）"))
     if snap is not None:
-        n_act = len([x for x in L if "卖出" in x or "买入" in x and "→" in x])
-        print(f"  对账基准 {snap.get('as_of')}：调仓建议 {len(suggestions) if 'suggestions' in dir() else '—'} 项")
+        # 注：原实现用 `'suggestions' in dir()` 判断，但模块级 dir() 恒为 False，
+        # 一直打印「—」。改为直接取局部变量（snap 非 None 分支必然已定义）。
+        n_act = len(suggestions)
+        dev_txt = ""
+        if sol is not None:
+            dev_txt = (f"；总绝对偏离 {sol['before_abs_dev']:.1f}pp → "
+                       f"{sol['total_abs_dev']:.1f}pp")
+        print(f"  对账基准 {snap.get('as_of')}：调仓建议 {n_act} 项{dev_txt}")
     print("  详见 runs/paper_trading.md")
     return 0
 

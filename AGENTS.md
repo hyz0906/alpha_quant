@@ -22,8 +22,10 @@ AlphaQuant：个人量化**信号生成系统**——免费数据源 → 三层�
 **代码库分层**（重要，改代码前先分清）：
 - **生产链**（每日在跑，改动需谨慎）：`scripts/qdii_daily.py` 编排 +
   `qdii_monitor.py` / `qdii_backtest.py` / `portfolio_live.py` /
-  `paper_trading.py`（模拟盘对账，第 ④ 步），共享库
-  `risk_parity.py` / `qdii_relchange_realistic.py` / `qdii_relchange_backtest.py`，
+  `paper_trading.py`（模拟盘对账，第 ④ 步）/
+  **`daily_advice.py`**（22:00 复盘，第 ⑤ 步，整数手最优求解收口），共享库
+  `risk_parity.py` / `qdii_relchange_realistic.py` / `qdii_relchange_backtest.py` /
+  **`rebalance_solver.py`**（整数手调仓求解，被上面两个入口共用），
   数据桥 `vibe_fetch_broker.py`，核心计算 `src/data_engine/qdii_calc.py`。
 - **研究脚本**（可复跑，非每日）：`strategy_matrix.py`（10 策略横评，新策略准入）、
   `portfolio_combined.py`（三层消融）、`value_timing_backtest.py`（PB 独立回测）。
@@ -108,6 +110,12 @@ tests/              4 个测试文件（test_gates/test_rsrs/test_llm/test_db_co
 7. 日志统一 loguru（`config.logging_config.setup_logging()`），不要裸 print。
 8. 新增依赖同步更新 `requirements.txt` 与 `pyproject.toml`。
 9. **生产脚本 ROOT 用 `__file__` 推导**（`parents[2]`），禁硬编码绝对路径。
+10. **整数手调仓逻辑只写在 `scripts/rebalance_solver.py`**：`daily_advice.py`
+    与 `paper_trading.py reconcile` 都 import 它，两个入口的建议必须完全一致。
+    禁止在任一脚本里再写一份份额取整逻辑（历史上 `reconcile` 自带「买卖腿分别
+    向下取整」，导致现金溢出、偏离 28.36pp vs 全局最优 21.41pp）。
+11. **净值写入按日去重**：`data/paper_nav.csv` 同一天重复跑 reconcile 要覆盖
+    当日旧行，不能追加——否则 `day_ret` 会取到同日旧值而失真。
 
 ## 6. 核心算法备忘（生产链）
 

@@ -79,13 +79,15 @@ python3 scripts/paper_trading.py entry-guide --capital 200000   # 建仓指导 �
 python3 scripts/paper_trading.py init --capital 200000          # 初始化账本（已有需 --force 重置）
 python3 scripts/paper_trading.py buy --code 511010.SH --shares 900   # 买入（100 份整数手）
 python3 scripts/paper_trading.py sell --code 511010.SH --shares 300  # 卖出
-python3 scripts/paper_trading.py reconcile                       # 估值 + 对账（自动比对目标权重）
+python3 scripts/paper_trading.py reconcile                       # 估值 + 对账（整数手最优求解）
 python3 scripts/paper_trading.py status                          # 账本视图
 ```
 
 对账报告 `runs/paper_trading.md`：实际权重 vs `portfolio_live.json` 目标权重，
-偏差 > 2pp 且金额超阈值才提示调仓（不足一手的偏差会标注「保持现金」）；
-净值历史 `data/paper_nav.csv` 每日追加。模拟盘建仓建议先跑 `entry-guide`
+调仓建议由整数手全局最优求解给出（阈值 2pp，与 `daily_advice.py` 共用
+`rebalance_solver.py`，结果一致）；不足一手 / 调后偏离变大的腿会标注不动原因。
+净值历史 `data/paper_nav.csv` 按日写入，**同一天重复跑会覆盖当日旧行而非追加**
+（否则 `day_ret` 会取到同日旧值而失真）。模拟盘建仓建议先跑 `entry-guide`
 拿到按整数手折算的份额表，再逐笔 `buy` 录入。
 
 ### 4.1c 每日复盘与调仓建议：`scripts/daily_advice.py`
@@ -105,11 +107,15 @@ python3 scripts/daily_advice.py --min-dev 0.02      # 调仓触发阈值（默�
 目标现金占比|，约束 100 份整手、0.15% 佣金、现金不可为负，用枚举搜索求全局最优
 （每腿只搜「理想手数 ±4 手」，总组合超 30 万自动收紧）。
 
-> ⚠️ 为什么不用 `paper_trading.py reconcile` 自带的建议：它对卖出腿与买入腿
-> **分别向下取整**，两边同时 floor 导致「卖出回款 > 买入支出」，多余现金溢出。
-> 2026-09-01 实测：原建议（卖 400 / 买 400）偏离 28.3pp、现金被抬到 24.1%；
-> 全局最优（卖 400 / 买 500）偏离 **21.3pp**、现金 19.1%。调仓建议一律以
-> `daily_advice.py` 为准。
+**求解器抽在 `scripts/rebalance_solver.py`**，两个入口共用，结果必然一致：
+`daily_advice.py` 与 `paper_trading.py reconcile` 都是它的调用方。改算法只改
+那一个模块，不要再在各脚本里各自实现一份。
+
+> 历史背景（2026-09-02 已修复）：早期 `reconcile` 对卖出腿与买入腿**分别向下
+> 取整**，两边同时 floor 导致「卖出回款 > 买入支出」、多余现金溢出。2026-09-01
+> 实测：旧建议（卖 400 / 买 400）偏离 28.36pp、现金被抬到 24.1%；全局最优
+> （卖 400 / 买 500）偏离 **21.41pp**、现金 19.1%（已用 10×13 全网格暴力枚举
+> 交叉验证，求解器输出与枚举最优完全一致）。
 
 ### 4.2 组合信号：`portfolio_live.py`
 
