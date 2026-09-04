@@ -188,7 +188,10 @@ def cmd_trade(side: str, code: str, shares: int, price: float | None,
     if shares <= 0 or shares % LOT != 0:
         print(f"⚠️ 份额必须为正且为 {LOT} 的整数倍。")
         return 1
-    px, last_d = (price, date) if price else (None, None)
+    # 注意：--price 手动指定时 last_d 必须为 None，否则流水备注会把「实盘成交价」
+    # 误标成「收盘价」（2026-09-04 回填实盘成交时踩到）
+    px = float(price) if price else None
+    last_d = None
     if px is None:
         v = get_last_close(code)
         if v is None:
@@ -222,7 +225,8 @@ def cmd_trade(side: str, code: str, shares: int, price: float | None,
     led.setdefault("trades", []).append({
         "date": trade_date, "code": code, "side": side, "shares": shares,
         "price": px, "amount": round(amount, 2), "fee": fee,
-        "note": f"成交价={last_d}收盘价",
+        "note": (f"成交价={last_d}收盘价" if last_d
+                 else f"成交价=手动指定（非收盘价）"),
     })
     save_ledger(led)
     print(f"✅ {side.upper()} {NAMES[code]} {shares} 份 @ {px:.3f} = {amount:,.2f}"

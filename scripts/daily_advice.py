@@ -38,7 +38,7 @@ DATA = ROOT / "data"
 
 # 整数手求解器抽到 rebalance_solver，与 paper_trading.py reconcile 共用同一实现，
 # 保证两个入口给出完全一致的调仓建议。改算法只改那一个模块。
-from rebalance_solver import FEE, LOT, solve_lots  # noqa: E402
+from rebalance_solver import FEE, LOT, MIN_GAIN_PP, solve_lots  # noqa: E402
 
 
 # ---------------------------------------------------------------- 基础读取
@@ -69,6 +69,35 @@ def load_names() -> dict:
         return {}
 
 
+def pick_nav_row(rows: list, ledger: dict, as_of: str) -> tuple[dict | None, str]:
+    """挑出与**当前账本状态**匹配的净值行。
+
+    为什么不能简单按 as_of 取行
+    --------------------------
+    as_of 是「信号数据日期」（各腿行情的交集日），而账本可能已经按上一份建议
+    在 update 日成交过。2026-09-02 实测：as_of=2026-09-01（510300.SH 缺当日
+    数据），但账本已含 09-02 的「卖 511010 400 份 / 买 511880 500 份」成交，
+    按 as_of 取行会显示成交前的旧估值（总资产 199,908.6 / 现金 32,219.2），
+    与下方持仓表（成交后，总资产 199,322.8 / 现金 38,149.4）自相矛盾。
+
+    现金是最可靠的对账锚：账本 cash 唯一对应一个净值快照。
+
+    Returns: (nav_row, 告警文案)
+    """
+    if not rows:
+        return None, ""
+    cash = float(ledger.get("cash", 0.0))
+    matched = [r for r in rows if abs(float(r["cash"]) - cash) < 1.0]
+    if matched:
+        return matched[-1], ""
+    for r in rows:
+        if r["date"] == as_of:
+            return r, (f"⚠️ 净值文件无与账本现金（{cash:,.2f}）匹配的行，"
+                       f"退回数据日期 {as_of} 行（账本可能已含未入账的成交）")
+    return rows[-1], (f"⚠️ 净值文件与账本现金不一致（账本 {cash:,.2f}），"
+                      f"取最后一行（{rows[-1]['date']}），总资产/盈亏可能失真")
+
+
 def pct(x: float, d: int = 2) -> str:
     return f"{x*100:.{d}f}%"
 
@@ -76,7 +105,7 @@ def pct(x: float, d: int = 2) -> str:
 # ---------------------------------------------------------------- 报告
 
 def build_report(as_of: str, premium, backtest, live, ledger, nav_row,
-                 names: dict, min_dev: float) -> tuple[str, dict]:
+                 names: dict, min_dev: float, nav_note: str = "") -> tuple[str, dict]:
     tw = live["target_weights"]
     fresh = live.get("data_freshness", {})
     pb = live.get("pb", {})
@@ -108,11 +137,13 @@ def build_report(as_of: str, premium, backtest, live, ledger, nav_row,
       f"｜ 成本：单边 0.15% ｜ 整数手 100 份\n")
 
     # ---- 1. 一句话结论
+    # min_dev 只是阶梯起点，求解器会自动放宽；报告按实际生效档位呈现
+    eff_dev = float(sol.get("min_dev_used", min_dev))
     n_act = len(sol["sells"]) + len(sol["buys"])
     A("## 1. 一句话结论\n")
     if n_act == 0:
-        A(f"**明日无需调仓** —— 当前持仓与目标权重偏离均在 {min_dev*100:.0f}pp "
-          f"阈值内（总绝对偏离 {sol['before_abs_dev']:.1f}pp）。\n")
+        A(f"**明日无需调仓** —— 净改善不足 {MIN_GAIN_PP:.2f}pp，调仓收益覆盖不了佣金"
+          f"（当前总绝对偏离 {sol['before_abs_dev']:.1f}pp）。\n")
     else:
         parts = []
         for c, sh in sorted(sol["sells"].items()):
@@ -138,8 +169,17 @@ def build_report(as_of: str, premium, backtest, live, ledger, nav_row,
         issues.append(f"⚠️ QDII 溢价数据滞后：{prem_stale}")
     if err_size > 0:
         issues.append(f"⚠️ qdii_daily.err.log 非空（{err_size} 字节）")
-    if premium.get("timestamp", "")[:10] != as_of:
-        issues.append(f"⚠️ 溢价快照时间戳 {premium.get('timestamp')} ≠ 数据日期 {as_of}")
+    # 快照只需是「今天」跑的即可；as_of 是数据日期，与快照日期不同属正常。
+    snap_day = premium.get("timestamp", "")[:10]
+    if not snap_day:
+        issues.append("⚠️ 溢价快照缺 timestamp 字段")
+    elif snap_day != datetime.now().strftime("%Y-%m-%d"):
+        issues.append(f"⚠️ 溢价快照非今日：{premium.get('timestamp')}")
+    # 真正要报的是「信号数据日期落后于行情最新日」——说明有腿缺当日数据。
+    ec_last = fresh.get("etf_close_last", "")
+    if ec_last and as_of and ec_last > as_of:
+        issues.append(f"⚠️ 信号数据日期 {as_of} 落后于行情最新日 {ec_last}"
+                      f"（至少有一条腿缺当日收盘，交集日被拉回）")
     if issues:
         for i in issues:
             A(f"- {i}")
@@ -202,8 +242,9 @@ def build_report(as_of: str, premium, backtest, live, ledger, nav_row,
               f"{r.get('dc_annual','')}% / {r.get('dc_sharpe','')} |")
         if ends:
             A("")
-            A(f"**数据新鲜度**：回测序列已刷新至 {ends[-1]}"
-              f"{'（与数据日期一致）' if ends[-1] == as_of else '（⚠️ 落后于数据日期 %s）' % as_of}")
+            tail = "（不落后于数据日期 %s）" % as_of if ends[-1] >= as_of \
+                else "（⚠️ 落后于数据日期 %s）" % as_of
+            A(f"**数据新鲜度**：回测序列已刷新至 {ends[-1]}{tail}")
     else:
         A("（backtest summary 为空，详见 runs/qdii_backtest.md）")
     A("")
@@ -214,7 +255,10 @@ def build_report(as_of: str, premium, backtest, live, ledger, nav_row,
         A(f"- 总资产 **{nav_row['total']}** 元（现金 {nav_row['cash']} + "
           f"市值 {nav_row['market']}）")
         A(f"- 当日 {float(nav_row['day_ret'])*100:+.2f}% ｜ "
-          f"累计 {float(nav_row['cum_ret'])*100:+.2f}%")
+          f"累计 {float(nav_row['cum_ret'])*100:+.2f}%"
+          f"（净值日 {nav_row['date']}）")
+    if nav_note:
+        A(f"- {nav_note}")
     A("")
     A("| 代码 | 名称 | 现价 | 持仓 | 实际占比 | 目标占比 | 偏差 | 拟动作 | 执行后占比 |")
     A("|---|---|---|---|---|---|---|---|---|")
@@ -239,7 +283,12 @@ def build_report(as_of: str, premium, backtest, live, ledger, nav_row,
     A(f"- 卖出回款（扣佣金）≈ {sol['proceeds']:,.0f} 元 ｜ "
       f"买入支出（含佣金）≈ {sol['spend']:,.0f} 元 ｜ "
       f"现金 {cash:,.0f} → {sol['cash_after']:,.0f} 元")
-    A(f"- 仅处理偏差 ≥ {min_dev*100:.0f}pp 的腿，其余为噪音不动")
+    if eff_dev < min_dev - 1e-9:
+        A(f"- 候选腿门槛 {min_dev*100:.1f}pp 会死锁/次优，求解器自动放宽至 "
+          f"**{eff_dev*100:.1f}pp** 并取全局最优整数手"
+          f"（求解方式：{sol.get('method', '?')}）")
+    else:
+        A(f"- 候选腿门槛 {min_dev*100:.1f}pp（求解方式：{sol.get('method', '?')}）")
     A("")
 
     # ---- 7. 明日指令
@@ -304,18 +353,15 @@ def main() -> int:
     ledger = _json(DATA / "paper_ledger.json")
 
     nav_row = None
+    nav_note = ""
     nav_f = DATA / "paper_nav.csv"
     if nav_f.exists():
         rows = list(csv.DictReader(open(nav_f, encoding="utf-8")))
-        for r in rows:
-            if r["date"] == as_of:
-                nav_row = r
-        if nav_row is None and rows:
-            nav_row = rows[-1]
+        nav_row, nav_note = pick_nav_row(rows, ledger, as_of)
 
     names = load_names()
     report, sol = build_report(as_of, premium, backtest, live, ledger,
-                               nav_row, names, args.min_dev)
+                               nav_row, names, args.min_dev, nav_note)
 
     out = RUNS / f"daily_advice_{as_of}.md"
     out.write_text(report, encoding="utf-8")
