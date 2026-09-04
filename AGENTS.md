@@ -130,6 +130,13 @@ tests/              4 个测试文件（test_gates/test_rsrs/test_llm/test_db_co
     两者不再互相否定。
 11. **净值写入按日去重**：`data/paper_nav.csv` 同一天重复跑 reconcile 要覆盖
     当日旧行，不能追加——否则 `day_ret` 会取到同日旧值而失真。
+    **净值的「一天」= 行情日，不是运行日**（2026-09-05 修）：行日期必须取持仓的
+    **行情最新日** `max(last_dates)`，不能取 `datetime.now()`。非交易日（周末 /
+    节假日）跑 reconcile 时最新收盘仍是上一交易日，按今天写行会插入一条数值与
+    上一行完全相同、`day_ret=0` 的**假交易日**，并把真实当日盈亏冲成 0。用行情日
+    则天然幂等（非交易日再跑 = 覆盖上一交易日那一行）。
+    ⚠️ 触发路径：21:30 cron 是 `1-5`（周末不跑），但 **22:00 WorkBuddy automation
+    是 `FREQ=DAILY`**，周末照样跑 `qdii_daily.py` → 其第 ④ 步 reconcile。
 
 ## 6. 核心算法备忘（生产链）
 
