@@ -423,6 +423,14 @@ def cmd_reconcile() -> int:
     total = mv + cash
     day = datetime.now().strftime("%Y-%m-%d")
 
+    # 净值行的日期取**行情最新日**，而不是墙上时钟的今天（2026-09-05 修）。
+    # 非交易日（周末 / 节假日）跑 reconcile 时，最新收盘仍是上一交易日；若按今天
+    # 写行，就会插入一条数值与上一行完全相同、day_ret=0 的假交易日，污染净值序列
+    # （手改 reconcile 在周六跑过一次，实测多出 2026-09-05 行）。
+    # 用行情日则天然幂等：非交易日再跑 = 覆盖上一交易日那一行，不新增。
+    mkt_days = [d for d in last_dates.values() if d and d != "—（缺数据）"]
+    nav_day = max(mkt_days) if mkt_days else day
+
     # 净值历史（同日去重）
     # 注意：必须真的去重——同一天多次跑 reconcile（调仓后重跑、手动补跑）
     # 若直接追加会累积重复行，prev_total 取到同日旧值导致 day_ret 失真。
@@ -430,7 +438,7 @@ def cmd_reconcile() -> int:
     if not nav.empty:
         nav = nav.copy()
         nav["date"] = pd.to_datetime(nav["date"])
-        same_day = nav["date"] == pd.Timestamp(day)
+        same_day = nav["date"] == pd.Timestamp(nav_day)
         if same_day.any():
             nav = nav[~same_day]              # 剔除当日旧行，稍后以新值覆盖
         prev_total = None if nav.empty else float(nav.iloc[-1]["total"])
@@ -439,7 +447,7 @@ def cmd_reconcile() -> int:
     day_ret = (total / prev_total - 1) if prev_total else None
     cum_ret = total / float(led["capital"]) - 1
     row = pd.DataFrame([{
-        "date": pd.Timestamp(day), "total": round(total, 2),
+        "date": pd.Timestamp(nav_day), "total": round(total, 2),
         "cash": round(cash, 2), "market": round(mv, 2),
         "day_ret": round(day_ret, 6) if day_ret is not None else None,
         "cum_ret": round(cum_ret, 6),
@@ -458,6 +466,9 @@ def cmd_reconcile() -> int:
                  "偏差 > 2pp 且金额差 > 阈值才提示调仓。\n")
     if any(d == "—（缺数据）" for d in last_dates.values()):
         L.append("> ⚠️ 部分标的缺行情数据，市值为 0，请检查 data/*.csv。\n")
+    if nav_day != day:
+        L.append(f"> ⚠️ 非交易日或行情未更新：最新收盘日为 **{nav_day}**，"
+                 f"净值行按 {nav_day} 覆盖写入，不新增 {day} 行。\n")
 
     # ---- 持仓明细 ----
     L.append("\n## 1. 持仓明细（按最新收盘价估值）\n")
