@@ -9,9 +9,11 @@
 口径（与回测逐字一致，不得偏离；L6 参数，2026-09-05 起，选型依据
 runs/tune_final.md + tune_stability.md）：
   * 底仓：w ∝ 1/σ^1.2、波动率地板 6%、**季频**再平衡（rp.build_weights，
-    模块常量 VOL_P/VOL_FLOOR_ANN/REBAL_FREQ）。「明日权重」=
-    build_weights(...).iloc[-1]——今日恰为本季最后交易日则为新算权重
-    （明日执行再平衡），否则为上季末权重的延续。
+    模块常量 VOL_P/VOL_FLOOR_ANN/REBAL_FREQ）。「明日权重」：今日为本期
+    （季/月，按 REBAL_FREQ）最后交易日 → 取末行新算权重（明日执行再平衡）；
+    否则 → 沿用上一完整期末的权重。⚠️ 2026-09-05 修：此前直接取
+    build_weights(...).iloc[-1]，而 build_weights 会把 panel 末日当成当期
+    再平衡点，导致底仓每天重算（日频漂移），与回测的季频持有不一致。
   * PB 门控：沪深300 PB 5 年滚动分位三档（<30% 全仓/30~70% 半仓/≥70% 空仓），
     月末算好 shift(1) 应用——回测原样口径（t+1 月使用 t-1 月末分位，比直觉
     多滞后一个月，但回测成绩就是这个口径跑出来的，实盘不擅自"修正"）。
@@ -261,8 +263,23 @@ def main(refresh: bool = True) -> int:
     data_stale = (today - as_of).days > STALE_DAYS
     etf_max = max(etf_last.values()) if etf_last else str(as_of.date())
 
-    # ---- 1. 底仓（明日权重 = 末行；季末则为新算权重）----
-    w_iv = rp.build_weights(panel, "inverse_vol").iloc[-1]
+    # ---- 1. 底仓（本期末=新算权重；期内=沿用上一完整期末权重）----
+    # ⚠️ build_weights 会把 panel 末日当成当期再平衡点（当期未走完，末日就是
+    # 该期在 panel 内的最后一行），直接取 .iloc[-1] 会让底仓每天都是当天新算
+    # ——实盘退化为日频漂移，与回测的季频持有不一致（2026-09-05 修，此前
+    # REBAL_FREQ="M" 时代同样中招）。正确语义：仅当今日为本期最后交易日时才
+    # 用末行新算权重（明日执行再平衡），否则沿用上一完整期末的权重。
+    w_panel = rp.build_weights(panel, "inverse_vol")
+    reb_ends = panel.index.to_series().groupby(
+        panel.index.to_period(rp.REBAL_FREQ)).last()
+    # 期末判定 +3 天：覆盖期末落在周末的情形（最坏：期末为周日，最后交易日
+    # 为周五，+3 天恰好跨入下一期）；交易日历缺失下的近似，节假日前会略保守。
+    period_end = ((as_of + pd.Timedelta(days=3)).to_period(rp.REBAL_FREQ)
+                  != as_of.to_period(rp.REBAL_FREQ))
+    if period_end or len(reb_ends) < 2:
+        w_iv = w_panel.iloc[-1]
+    else:
+        w_iv = w_panel.loc[reb_ends.iloc[-2]]
 
     # ---- 2. PB 门控（shift(1) 语义 = 回测原样口径）----
     # 乐咕缓存不可用时降级：档位取全仓并在报告显著标注（宁可告警，不可崩溃）
@@ -281,10 +298,10 @@ def main(refresh: bool = True) -> int:
         pb_next, pct_now, pct_month = 1.0, None, "—"
     legu_last = pct_month if (refresh or legu_last == "（未刷新）") and pb_ok else legu_last
 
-    # ---- 再平衡日判定（今日为本季最后交易日 → 明日执行季度再平衡）----
-    reb_ends = panel.index.to_series().groupby(
-        panel.index.to_period(rp.REBAL_FREQ)).last()
-    is_rebal_day = bool(reb_ends.iloc[-1] == as_of) and not data_stale
+    # ---- 再平衡日判定（今日为本期最后交易日 → 明日执行再平衡）----
+    # 旧实现 reb_ends.iloc[-1] == as_of 恒为 True（panel 末日必是当期组内最后
+    # 一行），2026-09-05 改为按日历期判定（见上方 period_end 注释）。
+    is_rebal_day = bool(period_end) and not data_stale
 
     # ---- 3. QDII 门控（明日）----
     qdii = {c: qdii_gate_next(c) for c in pc.QDII_LEGS}
