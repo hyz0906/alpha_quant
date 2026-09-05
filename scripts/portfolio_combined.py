@@ -14,11 +14,13 @@
   D. 三层全开（B + C）
 
 设计要点：
-  * 乘法门控：W_final = W_invvol(shift 1) × gate_leg，门控空缺为现金（收益 0），
-    不重新归一——「减仓持币」语义，不是「挪仓到别的腿」；
+  * 乘法门控：W_final = W_base(shift 1) × gate_leg，门控空缺为现金（收益 0），
+    不重新归一——但按 L6 口径，**月初锁定的空缺资金转入货币腿 511880**
+    （freed 按月取首日值，月内不变；月内新增的空缺仍为现金）；
   * 无前视：PB 分位 t 月末算好 shift 1 月应用；QDII spike_avoid_hold 状态机
     T 日信息决定 T+1 持仓（qdii_relchange_realistic 原版）；
-  * 统一单边成本 0.15%（月度再平衡 + 门控翻转都计）；
+  * 底仓为 L6 参数（季频 / w ∝ 1/σ^1.2 / 地板 6%，risk_parity 模块常量）；
+  * 统一单边成本 0.15%（季度再平衡 + 门控翻转都计）；
   * 样本 = 18 只共同样本（2020-08 起）——PB 门控证据腿（沪深300）与 QDII
     溢价数据在该窗口内均有完整历史。
 
@@ -60,6 +62,7 @@ A_STOCK_LEGS = [
 QDII_LEGS = ["513100.SH", "513500.SH", "513050.SH", "513880.SH",
              "513030.SH", "159920.SZ"]
 PB_GATE_SOURCE = "510300.SH"     # PB 分位信号源（沪深300，§7.19 证据腿）
+MMF_LEG = "511880.SH"            # 货币腿：门控空缺资金月频锁定的去向（L6）
 
 
 # --------------------------------------------------------------------------- #
@@ -103,17 +106,37 @@ def qdii_gate_daily(code: str, panel_index: pd.DatetimeIndex) -> pd.Series:
     if df is None or df.empty:
         return pd.Series(1.0, index=panel_index)
     z = relchange_zscore(df["premium"], RELCHANGE_WINDOW)
-    h = spike_avoid_hold(z, df["premium"])      # floor=1%、min_hold=5 默认
+    h = spike_avoid_hold(z, df["premium"])      # z=1.5、floor=0.5%（L6 默认）
     return h.reindex(panel_index).fillna(1.0).clip(0.0, 1.0)
 
 
 # --------------------------------------------------------------------------- #
 # 组合合成与回测
 # --------------------------------------------------------------------------- #
+def route_cash_to_mmf(w_base: pd.DataFrame, W: pd.DataFrame,
+                      mmf: str = MMF_LEG) -> pd.DataFrame:
+    """门控空缺资金月频锁定转入货币腿（L6，2026-09-05 起实盘口径）。
+
+    freed = 底仓权重和 − 门控后权重和（日频），按月取**首日值**锁定、月内不变
+    ——日频版（门控每翻转货币腿跟着买卖）会被 0.15% 手续费吃掉货币腿全部
+    利息，是实证败案（runs/tune_three_layer.md §4 / tune_round2.md）。
+    月内新增的空缺（如 QDII 中途减仓）仍为现金，次月初才入货币腿。
+    """
+    freed = (w_base.sum(axis=1) - W.sum(axis=1)).clip(lower=0.0)
+    freed_m = freed.groupby(freed.index.to_period("M")).transform("first")
+    W[mmf] = W[mmf] + freed_m
+    return W
+
+
 def build_final_weights(panel: pd.DataFrame, pb_rule: str = "triple",
                         pb_scope: str = "all_astock",
-                        use_pb: bool = True, use_qdii: bool = True) -> pd.DataFrame:
-    """W_final = W_invvol(shift 1) × gate_leg。门控空缺为现金（不归一）。"""
+                        use_pb: bool = True, use_qdii: bool = True,
+                        cash_mmf: bool = True) -> pd.DataFrame:
+    """W_final = W_base(shift 1) × gate_leg；空缺资金月频转货币腿（cash_mmf）。
+
+    底仓参数 = risk_parity 模块常量（L6：季频 / p=1.2 / 地板 6%）；
+    QDII 门控 = qdii_relchange_realistic 默认（z=1.5 / floor=0.5% / min_hold=5）。
+    """
     w = rp.build_weights(panel, "inverse_vol").shift(1).fillna(0.0)
     W = w.copy()
 
@@ -129,6 +152,9 @@ def build_final_weights(panel: pd.DataFrame, pb_rule: str = "triple",
             if c in W.columns:
                 gq = qdii_gate_daily(c, W.index)
                 W[c] = W[c] * gq.reindex(W.index).ffill().fillna(1.0)
+
+    if cash_mmf:
+        W = route_cash_to_mmf(w, W)
     return W
 
 
@@ -183,12 +209,12 @@ def flips_per_year(s: pd.Series) -> float:
 def turnover_breakdown(panel: pd.DataFrame, W_base: pd.DataFrame,
                        W_pb: pd.DataFrame, W_full: pd.DataFrame,
                        years: float) -> dict:
-    """拆解换手：按层增量 + 按发生日（月频再平衡 vs 日频门控）。"""
-    # 再平衡实际执行日 = 次月首个交易日（build_weights 月末赋值→ffill→shift(1)）
+    """拆解换手：按层增量 + 按发生日（季频再平衡 vs 日频门控）。"""
+    # 再平衡实际执行日 = 下一交易日（build_weights 期末赋值→ffill→shift(1)）
     idx = panel.index
-    month_ends = set(idx.to_series().groupby(idx.to_period("M")).last())
+    reb_ends = set(idx.to_series().groupby(idx.to_period(rp.REBAL_FREQ)).last())
     reb_days = {idx[i + 1] for i, d in enumerate(idx)
-                if d in month_ends and i + 1 < len(idx)}
+                if d in reb_ends and i + 1 < len(idx)}
 
     to_daily = W_full.diff().abs().sum(axis=1).fillna(0.0)
     act = to_daily[to_daily > 1e-9]
@@ -198,14 +224,14 @@ def turnover_breakdown(panel: pd.DataFrame, W_base: pd.DataFrame,
 
     return {
         "by_layer": {
-            "逆波动底仓(月频)": to_ann(W_base, years),
+            "逆波动底仓(季频)": to_ann(W_base, years),
             "PB门控增量(月频)": to_ann(W_pb, years) - to_ann(W_base, years),
             "QDII门控增量(日频)": to_ann(W_full, years) - to_ann(W_pb, years),
             "合计": to_ann(W_full, years),
         },
         "by_day": {
-            "月频再平衡执行日数": int(is_reb.sum()),
-            "月频换手/年": float(act[is_reb].sum() / years),
+            "再平衡执行日数(季频)": int(is_reb.sum()),
+            "再平衡换手/年": float(act[is_reb].sum() / years),
             "日频门控触发日数": int((~is_reb).sum()),
             "日频换手/年": float(act[~is_reb].sum() / years),
             "有换手交易日占比": float(len(act) / len(panel)),
@@ -302,8 +328,8 @@ def main():
         json.dumps(out, ensure_ascii=False, indent=2), encoding="utf-8")
 
     L = ["# 三层组合联合回测：逆波动底仓 × PB 估值门控 × QDII 溢价门控\n",
-         "> 乘法门控 `W = W_逆波动(shift1) × gate(腿)`，门控空缺为现金（不重新归一）。",
-         "> PB 分位 t 月末算好 t+1 月应用；QDII 门控为实盘约束版（floor=1%、min_hold=5），"
+         "> 乘法门控 `W = W_底仓(shift1) × gate(腿)`，空缺资金月频锁定转入货币腿 511880（月内新增空缺为现金）。",
+         "> PB 分位 t 月末算好 t+1 月应用；QDII 门控为实盘约束版（z=1.5、floor=0.5%、min_hold=5，L6 口径），"
          "T 日信号决定 T+1 持仓。统一单边成本 0.15%（月度再平衡 + 门控翻转均计）。",
          f"> 样本：18 只异构池共同样本 {panel.index[0].date()} ~ {panel.index[-1].date()}"
          f"（{panel.shape[0]} 个交易日）。\n",
@@ -347,7 +373,7 @@ def main():
     L.append("| 来源 | 频率 | 换手/年 | 占比 |")
     L.append("|---|---|---|---|")
     tot = tbd["by_layer"]["合计"]
-    for k, lbl in [("逆波动底仓(月频)", "月频（次月首个交易日执行）"),
+    for k, lbl in [("逆波动底仓(季频)", "季频（次一交易日执行）"),
                    ("PB门控增量(月频)", "月频（跨档才动作）"),
                    ("QDII门控增量(日频)", "日频（T+1 执行，min_hold=5）")]:
         v = tbd["by_layer"][k]
@@ -357,9 +383,9 @@ def main():
     L.append("**按换手发生日拆解**\n")
     L.append("| 类别 | 天数 | 换手/年 | 占比 |")
     L.append("|---|---|---|---|")
-    bsum = bd["月频换手/年"] + bd["日频换手/年"]
-    L.append(f"| 月频再平衡执行日 | {bd['月频再平衡执行日数']} | "
-             f"{bd['月频换手/年']:.2f} | {bd['月频换手/年']/bsum*100:.0f}% |")
+    bsum = bd["再平衡换手/年"] + bd["日频换手/年"]
+    L.append(f"| 季频再平衡执行日 | {bd['再平衡执行日数(季频)']} | "
+             f"{bd['再平衡换手/年']:.2f} | {bd['再平衡换手/年']/bsum*100:.0f}% |")
     L.append(f"| 日频门控触发日 | {bd['日频门控触发日数']} | "
              f"{bd['日频换手/年']:.2f} | {bd['日频换手/年']/bsum*100:.0f}% |")
     L.append(f"\n有换手的交易日占全部交易日 **{bd['有换手交易日占比']*100:.1f}%**"
@@ -376,11 +402,11 @@ def main():
         L.append(f"| {c} | {v*100:.1f}pp |")
     L.append(f"\n18 只中位数仅 **{tbd['per_asset_median']*100:.1f}pp/年**——"
              "换手高度集中在 QDII 腿。\n")
-    monthly_share = (tbd["by_layer"]["逆波动底仓(月频)"]
+    monthly_share = (tbd["by_layer"]["逆波动底仓(季频)"]
                      + tbd["by_layer"]["PB门控增量(月频)"]) / tot
     qdii_leg_w = float(Ws["D. 三层全开"][QDII_LEGS].mean().mean())
-    L.append("**结论**：**不是纯粹按月换手**，而是「月度再平衡 + 日频应急减仓」的混合结构。"
-             f"月频部分（逆波动 + PB）贡献 {monthly_share*100:.0f}% 换手、节奏固定可预期；"
+    L.append("**结论**：**不是纯粹按月换手**，而是「季度再平衡 + 月频 PB 调档 + 日频应急减仓」的混合结构。"
+             f"定期部分（逆波动季频 + PB 月频）贡献 {monthly_share*100:.0f}% 换手、节奏固定可预期；"
              f"QDII 门控是日频的、贡献 {(1-monthly_share)*100:.0f}%，"
              f"但单次翻转仅涉及约 {qdii_leg_w*100:.0f}% 的组合资金（单腿均重）。"
              f"按 0.15% 单边成本，年化换手成本 **{tot*0.0015*100:.2f}%**"
@@ -428,14 +454,15 @@ def main():
     L.append(f"- **换手可控且结构清晰**（详见 §5）：D 档年化单边换手 {d['turnover']:.2f}"
              f"（基线 {base['turnover']:.2f}），是 18 只资产权重变动的**加总**而非「全仓换手次数」——"
              f"摊到单只中位数仅 ~{tbd['per_asset_median']*100:.0f}pp/年。"
-             f"月频再平衡贡献 {monthly_share*100:.0f}%、日频 QDII 门控 {(1-monthly_share)*100:.0f}%；"
+             f"季频/月频定期部分贡献 {monthly_share*100:.0f}%、日频 QDII 门控 {(1-monthly_share)*100:.0f}%；"
              f"年化换手成本 {tot*0.0015*100:.2f}%（0.15% 单边），"
              f"即使抬到 0.50% 单边夏普仍有 {sens['成本=0.50%']['sharpe']:.2f}。")
     L.append("- **口径边界**：① QDII 单位净值 T+1~T+2 才公布，溢价序列存在固有的 ~1 日信息滞后"
              "（沿用 §7.18 全部回测的同款口径，状态机 T+1 执行 + min_hold=5 部分缓解）；"
              "② PB 门控用沪深300 分位代理全 A 股估值（对中证500/创业板腿是简化假设）；"
              "③ 样本 2020-08 起不含 2008/2015 完整熊市，PB 门控的强项年份部分缺席；"
-             "④ 门控空缺为现金（0 收益），不重新归一到其他腿——「减仓持币」语义。")
+             "④ 门控空缺资金月频锁定转入货币腿 511880（月内新增空缺为现金），"
+             "不重新归一到其他风险腿——「减仓持币」语义（L6 起货币腿吃下月频锁定部分）。")
 
     (ROOT / "runs" / "portfolio_combined.md").write_text("\n".join(L), encoding="utf-8")
     print("\n已写入: runs/portfolio_combined.md / runs/portfolio_combined.json")

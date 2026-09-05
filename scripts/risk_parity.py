@@ -12,8 +12,12 @@
 另做「核心三腿」（沪深300 + 黄金 + 国债，2015 起）长历史风险平价，作为
 经典股债金风险平价的对照。
 
-无前视：t 月末用此前 60 日数据算权重，t+1 月按该权重持有（weights.shift(1)）。
-月度再平衡，换手成本低。
+无前视：t 期末用此前 60 日数据算权重，t+1 期按该权重持有（weights.shift(1)）。
+底仓季频再平衡（REBAL_FREQ="Q"），换手成本低。
+
+L6 口径（2026-09-05 起，exp/new-strategy 分支四轮调优落地）：
+w ∝ 1/σ^VOL_P（VOL_P=1.2，介于逆波动与逆方差之间）、波动率地板 6%、季频再平衡。
+选型依据见 runs/tune_final.md + tune_stability.md（27 季度胜率 85.2%）。
 
 用法：python3 scripts/risk_parity.py
 """
@@ -33,11 +37,16 @@ ROOT = Path(__file__).resolve().parents[1]
 DATA_DIR = ROOT / "data"
 TRADING_DAYS = 252
 VOL_LOOKBACK = 60          # 波动率/协方差回看窗口（交易日）
-VOL_FLOOR_ANN = 0.025      # 波动率地板（年化）：货币腿 511880 年化波动仅 ~0.2%，
+VOL_FLOOR_ANN = 0.06       # 波动率地板（年化）：货币腿 511880 年化波动仅 ~0.2%，
                            # 逆波动权重 ∝ 1/vol 会把它推到 ~80% 霸占组合。
-                           # 钳到 2.5%（≈国债自然波动），货币腿与国债权重均衡，
-                           # 回到「现金管理」角色。ERC 协方差同步用地板后收益。
+                           # 地板同时是「收益档位旋钮」：2.5%（旧口径）→6%（L6），
+                           # 抬地板 = 削低波腿权重、增配高波腿，全样本年化 +2.4pp。
                            # 注意 vol 为日频，使用时换算：VOL_FLOOR_ANN/√252。
+VOL_P = 1.2                # 波动惩罚指数：w ∝ 1/σ^p。1.0=逆波动（旧口径），
+                           # 2.0=逆方差（类债）。L6 取 1.2：收益让渡 ~0.6pp 换
+                           # 回撤 -0.7pp 与夏普 +0.06（tune_round3 实证）。
+REBAL_FREQ = "Q"           # 底仓再平衡频率："Q"=季末（L6），"M"=月末（旧口径）。
+                           # 季频优于月频（夏普 +0.05、换手 -0.23，tune_round3）。
 SHRINK = 0.2               # 协方差收缩系数（向对角收缩，改善条件数）
 
 HETERO_CODES = [
@@ -71,8 +80,9 @@ def metrics(daily_ret: pd.Series) -> dict:
 # --------------------------------------------------------------------------- #
 # 权重构造
 # --------------------------------------------------------------------------- #
-def inverse_vol_weights(vol: pd.Series) -> pd.Series:
-    inv = 1.0 / vol.replace(0.0, np.nan)
+def inverse_vol_weights(vol: pd.Series, p: float = VOL_P) -> pd.Series:
+    """w ∝ 1/σ^p（p=1 逆波动 / p=2 逆方差；L6 现役 p=1.2）。"""
+    inv = 1.0 / (vol.replace(0.0, np.nan) ** p)
     return (inv / inv.sum()).fillna(0.0)
 
 
@@ -121,8 +131,9 @@ def build_weights(panel: pd.DataFrame, method: str) -> pd.DataFrame:
 
     波动率地板：vol.clip(lower=VOL_FLOOR)——近零波动资产（货币 ETF 年化波动
     ~0.2%）若不设地板，逆波动权重会给出 ~80% 的极端配比，组合退化为类现金。
-    地板设 2.5%（≈国债自然波动）后货币腿与国债权重均衡。ERC 用「地板后收益」
-    算协方差（rets × vol_f/vol），保证近零方差腿不导致数值爆炸。
+    逆波动加权为 w ∝ 1/σ^VOL_P；再平衡节奏 = REBAL_FREQ（季末/月末）。
+    ERC 用「地板后收益」算协方差（rets × vol_f/vol），保证近零方差腿不导致
+    数值爆炸。
     """
     rets = panel.pct_change(fill_method=None)
     vol = rets.rolling(VOL_LOOKBACK, min_periods=int(VOL_LOOKBACK * 0.5)).std()
@@ -130,10 +141,10 @@ def build_weights(panel: pd.DataFrame, method: str) -> pd.DataFrame:
     vol_f = vol.clip(lower=VOL_FLOOR_ANN / np.sqrt(TRADING_DAYS))
     w = pd.DataFrame(0.0, index=panel.index, columns=panel.columns)
 
-    # 月末交易日列表
-    month_ends = panel.index.to_series().groupby(panel.index.to_period("M")).last()
+    # 再平衡日列表（REBAL_FREQ：季末/月末最后一个交易日）
+    reb_ends = panel.index.to_series().groupby(panel.index.to_period(REBAL_FREQ)).last()
 
-    for me in month_ends:
+    for me in reb_ends:
         vol_row = vol_f.loc[me].dropna()
         if vol_row.empty:
             continue
@@ -141,7 +152,7 @@ def build_weights(panel: pd.DataFrame, method: str) -> pd.DataFrame:
         if method == "equal":
             wgt = pd.Series(1.0 / len(cols), index=cols)
         elif method == "inverse_vol":
-            wgt = inverse_vol_weights(vol_row)
+            wgt = inverse_vol_weights(vol_row, p=VOL_P)
         elif method == "inverse_var":
             wgt = inverse_var_weights(vol_row)
         elif method == "erc":
@@ -246,15 +257,15 @@ def main():
     w18_erc = build_weights(common, "erc").iloc[-1]
 
     L = ["# 被动基线 + 风险平价组合报告\n",
-         "> 月度再平衡，无前视（t 月末用此前 60 日数据定权重，t+1 月持有）。",
+         "> 底仓季频再平衡（L6 口径：w ∝ 1/σ^1.2、地板 6%），无前视（t 期末用此前 60 日数据定权重，t+1 期持有）。",
          "> 等风险贡献(ERC)用 scipy SLSQP 求解 + 协方差 20% 对角收缩。\n"]
     for title, r in [("18 只异构池（2020-01 起）", r18), ("核心三腿 股/金/债（2015-01 起）", rcore)]:
         L.append(f"## {title}\n")
         L.append("| 策略 | 年化收益 | 年化波动 | 夏普 | 最大回撤 | Calmar | 年化换手 |")
         L.append("|---|---|---|---|---|---|---|")
         order = ["equal_weight_daily", "equal", "inverse_vol", "inverse_var", "erc"]
-        label = {"equal_weight_daily": "等权(每日)", "equal": "等权(月度)",
-                 "inverse_vol": "风险平价·逆波动", "inverse_var": "风险平价·逆方差",
+        label = {"equal_weight_daily": "等权(每日)", "equal": "等权(季频)",
+                 "inverse_vol": "风险平价·逆波动(σ^1.2)", "inverse_var": "风险平价·逆方差",
                  "erc": "风险平价·等风险贡献"}
         for k in order:
             m = r.get(k)
@@ -293,7 +304,7 @@ def main():
     L.append("- **样本口径说明**：本表「18 只池」用共同样本（2020-01 起，全 18 只齐备，"
              f"受 159981 上市日约束），等权(月度)夏普 {ew18:.2f}；"
              "§7.12 的 0.60 是「随上市扩池」另一口径，两者不可直接比。")
-    L.append("- 月度再平衡换手远低于 RSRS 周频（152 倍/年），成本友好。")
+    L.append("- 季频再平衡换手远低于 RSRS 周频（152 倍/年），成本友好。")
 
     (ROOT / "runs" / "risk_parity.md").write_text("\n".join(L), encoding="utf-8")
     print("\nMarkdown 已写入: runs/risk_parity.md")

@@ -29,8 +29,11 @@ from src.data_engine.qdii_calc import relchange_zscore, RELCHANGE_WINDOW, RELCHA
 
 ROOT = Path(__file__).resolve().parents[1]
 
-# 实盘约束默认参数
-FLOOR = 1.0        # 触发前提：溢价 > 1% 才看 z（%）
+# 实盘约束默认参数（L6 口径，2026-09-05 起：z 2.0→1.5、floor 1%→0.5%，
+# 选型依据 runs/tune_round2.md —— 全样本夏普 +0.10、OOS +0.12，
+# 代价是 QDII 单边上涨季 −0.76pp，风险端改善大于收益端）
+Z_HI = 1.5         # 触发阈值：一阶差分 z > +1.5 → 次日空仓
+FLOOR = 0.5        # 触发前提：溢价 > 0.5% 才看 z（%）
 MIN_HOLD = 5       # 最小持有期：空仓至少 5 交易日才买回
 COST = 0.0015      # 单边交易成本 0.15%（佣金 + 冲击 + 滑点 + 限购摩擦）
 
@@ -39,7 +42,7 @@ MINHOLD_GRID = [1, 3, 5, 10, 20]
 COST_GRID = [0.0, 0.0005, 0.0015, 0.003]
 
 
-def spike_avoid_hold(z: pd.Series, premium: pd.Series, z_hi: float = RELCHANGE_Z,
+def spike_avoid_hold(z: pd.Series, premium: pd.Series, z_hi: float = Z_HI,
                      floor: float = FLOOR, min_hold: int = MIN_HOLD) -> pd.Series:
     """飙升回避持仓（实盘约束版，状态机，无前视）。
 
@@ -137,7 +140,7 @@ def main():
     # ---- Markdown ----
     L = ["# QDII 溢价「飙升回避」实盘约束版回测报告\n",
          f"> 信号：溢价一阶差分滚动 z 分数（窗口 {RELCHANGE_WINDOW} 交易日，滞后 1 期，无前视）。",
-         f"> 实盘约束：触发前提 floor={FLOOR}%（premium>floor 才看 z）、最小持有期 {MIN_HOLD} 日、单边成本 {COST*100:.2f}%。",
+         f"> 实盘约束：触发前提 floor={FLOOR}%（premium>floor 才看 z）、阈值 z>{Z_HI}、最小持有期 {MIN_HOLD} 日、单边成本 {COST*100:.2f}%。",
          "> 收益口径：前复权价日收益（已消份额拆分）；信号 T 日 → 调仓 T+1 日。\n"]
 
     L.append("## 1. 理想版 vs 实盘约束版（全量 2018-2026）\n")
@@ -155,13 +158,13 @@ def main():
     L.append("| 组合平均净年化超额 | " + " | ".join(
         f"{sum(sens_floor[f])/len(sens_floor[f]):+.1f}" for f in FLOOR_GRID) + " |")
 
-    L.append("\n## 3. 最小持有期敏感性（min_hold 交易日，floor=1%、cost=0.15%）\n")
+    L.append(f"\n## 3. 最小持有期敏感性（min_hold 交易日，floor={FLOOR}%、cost=0.15%）\n")
     L.append("| min_hold | " + " | ".join(str(m) for m in MINHOLD_GRID) + " |")
     L.append("|---|" + "|".join(["---"] * len(MINHOLD_GRID)) + "|")
     L.append("| 组合平均净年化超额 | " + " | ".join(
         f"{sum(sens_hold[m])/len(sens_hold[m]):+.1f}" for m in MINHOLD_GRID) + " |")
 
-    L.append("\n## 4. 单边成本敏感性（cost，floor=1%、min_hold=5）\n")
+    L.append(f"\n## 4. 单边成本敏感性（cost，floor={FLOOR}%、min_hold=5）\n")
     L.append("| cost | " + " | ".join(f"{c*100:.2f}%" for c in COST_GRID) + " |")
     L.append("|---|" + "|".join(["---"] * len(COST_GRID)) + "|")
     L.append("| 组合平均净年化超额 | " + " | ".join(

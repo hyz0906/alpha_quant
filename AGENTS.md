@@ -7,9 +7,12 @@
 
 AlphaQuant：个人量化**信号生成系统**——免费数据源 → 三层组合信号 → 人工执行。
 
-- **现行实盘口径 = 三层组合**：逆波动底仓（18 只异构 ETF）× PB 估值门控（沪深300，
-  A 股 7 腿） × QDII 溢价门控（6 只 QDII 腿）。样本内夏普 1.63 / 回撤 −5.2%
-  （2020-08~2026-08，已扣 0.15% 单边成本，T→T+1 无前视）。
+- **现行实盘口径 = 三层组合（L6 参数，2026-09-05 起）**：底仓 w∝1/σ^1.2、
+  波动率地板 6%、季频再平衡（18 只异构 ETF）× PB 估值门控（沪深300，
+  A 股 7 腿） × QDII 溢价门控（z=1.5、floor=0.5%，6 只 QDII 腿）× 空缺资金
+  月频锁定转货币腿 511880。全样本净年化 +10.46% / 夏普 1.71 / 回撤 −6.2%
+  （2020-01~2026-09，已扣 0.15% 单边成本，T→T+1 无前视；27 季度滚动胜率
+  85.2%）。选型依据见 WORKFLOW.md §7.28。
 - **不是自动交易系统**：不接券商账户，所有下单由人执行（`TRADING_GUIDE.md`）。
 - 每日 21:30 定时任务产出 `runs/portfolio_live.md`（明日目标持仓 + 动作清单），
   并自动对账 20 万模拟盘（`runs/paper_trading.md`，账本 `data/paper_ledger.json`）。
@@ -27,8 +30,10 @@ AlphaQuant：个人量化**信号生成系统**——免费数据源 → 三层�
   `risk_parity.py` / `qdii_relchange_realistic.py` / `qdii_relchange_backtest.py` /
   **`rebalance_solver.py`**（整数手调仓求解，被上面两个入口共用），
   数据桥 `vibe_fetch_broker.py`，核心计算 `src/data_engine/qdii_calc.py`。
-- **研究脚本**（可复跑，非每日）：`strategy_matrix.py`（10 策略横评，新策略准入）、
-  `portfolio_combined.py`（三层消融）、`value_timing_backtest.py`（PB 独立回测）。
+- **研究脚本**（可复跑，非每日）：`strategy_matrix.py`（11 策略横评，新策略准入；
+  THREE=现行 L6 口径、THREE_V1=旧口径对照），
+  `portfolio_combined.py`（三层消融）、`value_timing_backtest.py`（PB 独立回测）、
+  `tune_*.py`（2026-09 L6 调参的七份研究脚本，历史报告可复现，勿删）。
 - **历史遗产**（RSRS 路线，已证伪，不在生产链）：`src/backtest/`、
   `src/strategies/`、`src/execution/`、`src/database/`、`src/dashboard/`、
   `src/analysis/`、`src/llm_agent/`、`main.py`、`scripts/init_db.py`、`scripts/archive/`（18 个一次性研究脚本）。

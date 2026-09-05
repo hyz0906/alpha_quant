@@ -1342,11 +1342,96 @@ D 档三层全开 + 月频 mom12_1 组内倾斜（A股/QDII/商品三组，z 分
 修正后全面优于旧口径，门控贡献链清晰：VALUE 1.30 → QDII_ABS 1.52 → THREE
 1.63；risk_parity 18 池逆波动夏普 0.87→1.09（§7.15 表为旧口径）。
 「新池无地板」夏普 2.59 但年化仅 +3.19% 是假象——组合退化为类现金（货币腿
-~80%），印证地板设计的必要性。
+    ~80%），印证地板设计的必要性。
 
 **实盘信号（2026-08-31 收盘，portfolio_live.py 现行口径）**：PB 73.3%→A股
 空仓、QDII 无翻转、现金 16.5%、国债 28.9% + 货币 28.9% 双底仓。对账建议
 2 项调仓：卖国债 400 份 → 买货币 400 份。
+
+### 7.28 三层组合参数调优 → L6 口径落地（2026-09-05）
+
+**问题**：现役三层组合夏普 1.63 / 年化 8.20% / 回撤 −5.2% 是 2020-08 至
+2026-08 的样本内成绩，参数是否有提升空间未知；按既定流程"研究 → 调参 →
+`strategy_matrix.py` 准入 → 实盘代码落地"做一次完整审计。
+
+**实证路径**（7 份研究脚本，~ 400 组合网格，全部按 IS(~2023-06) / OOS(2023-07~)
+双列评估，只认 OOS 也提升的改进）：
+
+| 脚本 | 范围 | 关键发现 |
+|---|---|---|
+| `tune_three_layer.py` | 15 个旋钮 × 4 档 = 60 组合 | 4 个通过 OOS：QDII z=1.5/floor=0.5、再平衡季频、空缺月频锁货币腿、地板 6% |
+| `tune_round2.py` | 8 个组合交互验证 | L2 三项免费改进（季频+z1.5/f0.5+月频货币腿）年化 +0.47pp、夏普 +0.18、回撤变小，零代价 |
+| `tune_round3.py` | 底仓 `w ∝ 1/σ^p`（p=0.8~2.4） | 底仓是连续旋钮：p=1 现役、p=2 逆方差。p≥1.6 高夏普是债 beta（债+货 74~85% 暴露），实盘不可行（需 6~8×杠杆融资成本吃光） |
+| `tune_final.py` | L2/L3/L4/L5/L6 叠加 | L6（季频 + z1.5/f0.5 + 月频货币腿 + 地板 6% + p=1.2）全样本 10.46%/1.71/OOS 1.72 |
+| `tune_window.py` | 任意窗口子样本 | 工具化，给定窗口重跑 12 方案 |
+| `tune_2026h1.py` | 2026-01~06 子样本 | L6 +1.45pp，但「抬地板」几乎失效（+0.07pp），回撤却扩 55%——地板收益 regime 依赖 |
+| `tune_stability.py` | 27 季度 + 14 半年的跨窗口滚动 | L6 胜率 85.2%（13/14 半年为正，唯一例外 2023H1 −0.18pp），L4 胜率 81.5% |
+
+**意外发现**（推翻早期判断）：
+
+1. **z=1.5 的真实贡献在风险端而非收益端**：全样本夏普 +0.10 是 z 阈值更灵敏
+   降低 QDII 高波动季回撤的产物；季度胜率仅 48.1%（等同抛硬币）、均值 +0.007pp；
+   代价是 QDII 单边上涨季 −0.76pp。好消息：与地板叠加后胜率从 48% 提到 81%。
+2. **PB 门控绝对不能拆**（即使 2026H1 跑输沪深300）：关掉后季度胜率 25.9%、
+   最差季 −2.04pp；牛市里多赚（2020H2 +2.17pp）但熊市/震荡季亏更多。
+3. **单窗口定参数不可靠**：2026H1 说 L2 好、2025Q1 说 L2 差（−0.81pp），
+   跨窗口胜率才是定参依据。
+
+**最终建议**（按目标选档）：
+
+| 方案 | 配置 | 全样本 | OOS | 胜率 |
+|---|---|---|---|---|
+| 现役（旧） | 月频/p1/地板2.5%/z2/f1/持现金 | 8.20%/1.63/−5.2% | — | — |
+| **L2**（零风险） | 季频 + z1.5/f0.5 + 月频货币腿 | 8.67%/1.81/−4.8% | 1.77 | 63% |
+| **L4**（收益优先） | L2 + 地板 6% | **11.07%/1.65/−6.9%** | 1.65 | **81.5%** |
+| **L6**（最稳） | L2 + 地板 6% + p=1.2 | 10.46%/**1.71**/−6.2% | 1.72 | **85.2%** |
+
+**落地改动**（`exp/new-strategy` 分支 → 已合并 main）：
+
+1. `scripts/risk_parity.py`：
+   - `VOL_P = 1.2`、`VOL_FLOOR_ANN = 0.06`、`REBAL_FREQ = "Q"` 模块常量
+   - `inverse_vol_weights(vol, p=VOL_P)` 显式接收 p
+   - 再平衡日列表按 `REBAL_FREQ`（季末/月末最后交易日）分组
+2. `scripts/qdii_relchange_realistic.py`：
+   - `Z_HI = 1.5`、`FLOOR = 0.5` 模块常量（z_hi/floor 仍可由调用方传入）
+   - 报告文案同步更新
+3. `scripts/portfolio_combined.py`：
+   - `MMF_LEG = "511880.SH"` 常量；新增 `route_cash_to_mmf()`（freed 月频首日值锁定，月内不变）
+   - `build_final_weights()` 增加 `cash_mmf=True` 默认；按 L6 写明"门控空缺资金月频锁定转入银华日利"
+   - 换手拆解：原"按月换手"→"季度再平衡+月频 PB 调档+日频 QDII 应急"
+4. `scripts/strategy_matrix.py`：
+   - THREE 切到 L6 口径（inv_base 模块常量直接生效）
+   - 新增 THREE_V1：旧口径对照，方法 `legacy_inv_base()` 临时改写 risk_parity 常量（用 try/finally 恢复）
+   - qdii_gate 增加 z_hi/floor 可选参数
+5. `scripts/portfolio_live.py`：
+   - 月末判定 `is_month_end` → 季末判定 `is_rebal_day`（按 rp.REBAL_FREQ）
+   - 明日目标权重新增"空缺资金月频锁定转货币腿"路由——明日跨月则按明日门控重算锁值，否则沿用本月首日锁值
+   - 动作归因优先级：QDII 门控 > 货币腿锁定更新 > PB 调档 > 季度再平衡 > 漂移修正
+   - snapshot JSON `params` 字段补 `vol_lookback/vol_p/vol_floor_ann_pct/rebal_freq/cash_mmf_leg/profile`
+6. `scripts/daily_advice.py`：`is_month_end` → `is_rebal_day` 文案同步
+7. `scripts/tune_*.py`：本地保存历史口径（`base_weights_p` / `inv_base` 显式接收
+   lookback/floor/p/freq 参数，不读模块常量），避免被新默认值污染。
+8. `AGENTS.md` §1 改 L6 口径；§4「研究脚本」加 `tune_*.py` 说明。
+
+**验证**（全部回归通过）：
+
+- `pytest tests/ -q` → 10 passed
+- `strategy_matrix.py` → THREE = 10.46%/1.71/−6.2%（与 tune_final L6 一致）、
+  THREE_V1 = 8.20%/1.63/−5.2%（与 §7.26 表完全一致）
+- `portfolio_live.py --no-refresh` → 信号自洽：PB 73.3% → A 股腿 0% → 空缺
+  25.7% 全部进银华日利（21.4% + 25.7% = 47.1% ✓，现金 0%）
+
+**Worktree 经验**（已写入 `MEMORY.md`）：21:30 cron + 22:00 automation 都
+硬编码 `/home/hyz0906/workspace/alpha_quant`，主目录切分支会污染定时任务；
+新策略验证一律 `git worktree add -b exp/<name> .../alpha_quant-exp main`，
+且 worktree 需手动补齐 `.gitignore` 运行期文件（`cp -a data/ alphaquant.db`、
+`mkdir logs output runs`）。本次从 exp/new-strategy 合并回 main 即用此模式。
+
+**重大语义变化提醒**（防后续"看似 bug、实为刻意"误判）：
+AGENTS.md §5.2「门控空缺 = 现金」已被 L6 部分修正——空缺资金在**月初**
+锁定转入银华日利 511880（月频），**月内新增的空缺**仍为现金。下次有意改
+"门控空缺"的代码前必读 `portfolio_combined.py` 的 `route_cash_to_mmf()`
+docstring 与本节。
 
 ### 7.3 数据正确性核验
 

@@ -57,10 +57,13 @@ def load_panel() -> pd.DataFrame:
 
 
 def qdii_gate(code: str, panel: pd.DataFrame,
-              kind: str) -> pd.Series:
-    """QDII 腿门控序列（0=空仓 1=持有），对齐 panel.index，fgap 用 ffill。
+              kind: str, z_hi: float | None = None,
+              floor: float | None = None) -> pd.Series:
+    """QDII 腿门控序列（0=空仓 1=持有），对齐 panel.index，缺口用 ffill。
 
-    kind: abs / rel / real / disc
+    kind: abs / rel / real / disc；z_hi/floor 仅对 real 生效
+    （缺省 = qdii_relchange_realistic 模块默认，即 L6 口径 z=1.5/floor=0.5%；
+    THREE_V1 传旧值 2.0/1.0）。
     """
     df = qbt.load_premium_history(code.split(".")[0])
     if df is None or df.empty:
@@ -72,7 +75,9 @@ def qdii_gate(code: str, panel: pd.DataFrame,
         h = relb.spike_avoid_hold(z)
     elif kind == "real":
         z = relchange_zscore(df["premium"], RELCHANGE_WINDOW)
-        h = relr.spike_avoid_hold(z, df["premium"])
+        kw = {**({"z_hi": z_hi} if z_hi is not None else {}),
+              **({"floor": floor} if floor is not None else {})}
+        h = relr.spike_avoid_hold(z, df["premium"], **kw)
     elif kind == "disc":
         h = qbt.discount_hold(df, thr=QDII_ABS_THR)
     else:
@@ -81,7 +86,18 @@ def qdii_gate(code: str, panel: pd.DataFrame,
 
 
 def inv_base(panel: pd.DataFrame) -> pd.DataFrame:
+    """L6 底仓（risk_parity 模块常量：季频 / p=1.2 / 地板 6%）。"""
     return rp.build_weights(panel, "inverse_vol").shift(1).fillna(0.0)
+
+
+def legacy_inv_base(panel: pd.DataFrame) -> pd.DataFrame:
+    """旧口径底仓（月频 / p=1 / 地板 2.5%），THREE_V1 对照专用。"""
+    saved = (rp.VOL_LOOKBACK, rp.VOL_FLOOR_ANN, rp.VOL_P, rp.REBAL_FREQ)
+    rp.VOL_LOOKBACK, rp.VOL_FLOOR_ANN, rp.VOL_P, rp.REBAL_FREQ = 60, 0.025, 1.0, "M"
+    try:
+        return rp.build_weights(panel, "inverse_vol").shift(1).fillna(0.0)
+    finally:
+        rp.VOL_LOOKBACK, rp.VOL_FLOOR_ANN, rp.VOL_P, rp.REBAL_FREQ = saved
 
 
 def build_strategies(panel: pd.DataFrame) -> dict[str, pd.DataFrame]:
@@ -107,13 +123,24 @@ def build_strategies(panel: pd.DataFrame) -> dict[str, pd.DataFrame]:
             W[c] = W[c] * gq.reindex(W.index).ffill().fillna(1.0)
         Ws[name] = W
 
-    W = inv_base(panel)
+    Wb = inv_base(panel)
+    W = Wb.copy()
     for c in pc.A_STOCK_LEGS:
         W[c] = W[c] * g_pb.reindex(W.index).ffill().fillna(1.0)
     for c in pc.QDII_LEGS:
         gq = qdii_gate(c, panel, "real")
         W[c] = W[c] * gq.reindex(W.index).ffill().fillna(1.0)
+    W = pc.route_cash_to_mmf(Wb, W)   # L6：空缺资金月频锁定转货币腿
     Ws["THREE"] = W
+
+    # THREE_V1：旧口径对照（2026-09-05 前实盘 = 月频 / p1 / 地板2.5% / z2 / f1 / 持现金）
+    Wv = legacy_inv_base(panel)
+    for c in pc.A_STOCK_LEGS:
+        Wv[c] = Wv[c] * g_pb.reindex(Wv.index).ffill().fillna(1.0)
+    for c in pc.QDII_LEGS:
+        gq = qdii_gate(c, panel, "real", z_hi=2.0, floor=1.0)
+        Wv[c] = Wv[c] * gq.reindex(Wv.index).ffill().fillna(1.0)
+    Ws["THREE_V1"] = Wv
 
     # --- 轮动对比组 ---
     px300 = panel["510300.SH"]
@@ -198,8 +225,10 @@ def main() -> int:
           "**轮动对比组**：ROT_EB 是 §7 大类轮动路线的代表（降回撤不加收益）；"
           "BH300 是单资产暴露基准。",
           "",
-          "**结论**：三层全开（THREE）为全部策略中风险调整后最优（夏普最高、"
-          "回撤最小），印证 §7.20~7.21 的收口判断。详见 WORKFLOW.md §7.26。"]
+          "**结论**：三层全开（THREE，L6 参数：季频/p1.2/地板6%/z1.5/f0.5/货币腿路由）"
+          "为全部策略中风险调整后最优（夏普最高、回撤可控）；THREE_V1 为 2026-09-05 前"
+          "旧口径对照，THREE 与 THREE_V1 的差 = L6 调参的全部净效果"
+          "（选型依据 runs/tune_final.md + tune_stability.md，27 季度胜率 85.2%）。"]
 
     out = ROOT / "runs" / "strategy_matrix.md"
     out.write_text("\n".join(L), encoding="utf-8")

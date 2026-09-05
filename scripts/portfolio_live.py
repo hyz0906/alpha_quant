@@ -6,17 +6,21 @@
 每日定时任务收盘后调用，输出三层门控状态 + 明日目标权重 + 动作清单
 （与上一快照的权重差，含归因）-> runs/portfolio_live.md / .json
 
-口径（与 §7.20 回测逐字一致，不得偏离）：
-  * 逆波动底仓：月末用此前 60 日波动率定权、次月持有（rp.build_weights）。
-    「明日权重」= build_weights(...).iloc[-1]——今日恰为本月最后交易日则为
-    新算权重（明日执行再平衡），否则为上月末权重的延续，与回测
-    月末赋值→ffill→shift(1) 语义等价。
+口径（与回测逐字一致，不得偏离；L6 参数，2026-09-05 起，选型依据
+runs/tune_final.md + tune_stability.md）：
+  * 底仓：w ∝ 1/σ^1.2、波动率地板 6%、**季频**再平衡（rp.build_weights，
+    模块常量 VOL_P/VOL_FLOOR_ANN/REBAL_FREQ）。「明日权重」=
+    build_weights(...).iloc[-1]——今日恰为本季最后交易日则为新算权重
+    （明日执行再平衡），否则为上季末权重的延续。
   * PB 门控：沪深300 PB 5 年滚动分位三档（<30% 全仓/30~70% 半仓/≥70% 空仓），
     月末算好 shift(1) 应用——回测原样口径（t+1 月使用 t-1 月末分位，比直觉
-    多滞后一个月，但回测成绩 1.28 夏普就是这个口径跑出来的，实盘不擅自"修正"）。
-  * QDII 门控：溢价一阶差分 60 日 z 状态机（floor=1%、min_hold=5、z=+2）。
+    多滞后一个月，但回测成绩就是这个口径跑出来的，实盘不擅自"修正"）。
+  * QDII 门控：溢价一阶差分 60 日 z 状态机（z=1.5、floor=0.5%、min_hold=5）。
     「明日持仓」= 溢价序列末尾追加一行 NaN 再跑状态机取末值——状态机处理完
     最后一行真实数据后的 state 即 T+1 持仓，与回测 T→T+1 语义一致。
+  * 货币腿路由（L6 新增）：门控空缺资金**月频锁定**转入 511880（freed 按月
+    取首日值，月内不变；月内新增空缺仍为现金，次月初才入货币腿）。日频版
+    （门控每翻转货币腿跟着买卖）会被手续费吃掉全部利息，是实证败案。
 
 数据刷新（免费通道，失败降级用旧数据并在报告标注）：
   * 18 只 ETF 收盘价：落后于今日时经 vibe broker（tencent 前复权链）增量
@@ -51,6 +55,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))       # scripts/
 import risk_parity as rp
 import portfolio_combined as pc
 import qdii_backtest as qbt
+import qdii_relchange_realistic as relr
 from src.data_engine.qdii_calc import relchange_zscore, RELCHANGE_WINDOW
 from qdii_relchange_realistic import spike_avoid_hold
 
@@ -256,7 +261,7 @@ def main(refresh: bool = True) -> int:
     data_stale = (today - as_of).days > STALE_DAYS
     etf_max = max(etf_last.values()) if etf_last else str(as_of.date())
 
-    # ---- 1. 逆波动底仓（明日权重 = 末行；月末则为新算权重）----
+    # ---- 1. 底仓（明日权重 = 末行；季末则为新算权重）----
     w_iv = rp.build_weights(panel, "inverse_vol").iloc[-1]
 
     # ---- 2. PB 门控（shift(1) 语义 = 回测原样口径）----
@@ -276,9 +281,10 @@ def main(refresh: bool = True) -> int:
         pb_next, pct_now, pct_month = 1.0, None, "—"
     legu_last = pct_month if (refresh or legu_last == "（未刷新）") and pb_ok else legu_last
 
-    # ---- 月末判定（今日为本月最后交易日 → 明日执行月度再平衡）----
-    month_ends = panel.index.to_series().groupby(panel.index.to_period("M")).last()
-    is_month_end = bool(month_ends.iloc[-1] == as_of) and not data_stale
+    # ---- 再平衡日判定（今日为本季最后交易日 → 明日执行季度再平衡）----
+    reb_ends = panel.index.to_series().groupby(
+        panel.index.to_period(rp.REBAL_FREQ)).last()
+    is_rebal_day = bool(reb_ends.iloc[-1] == as_of) and not data_stale
 
     # ---- 3. QDII 门控（明日）----
     qdii = {c: qdii_gate_next(c) for c in pc.QDII_LEGS}
@@ -290,7 +296,7 @@ def main(refresh: bool = True) -> int:
         if v["prem_last"] and (as_of - pd.Timestamp(v["prem_last"])).days > PREM_STALE_DAYS
     }
 
-    # ---- 明日目标权重 ----
+    # ---- 明日目标权重（底仓末行 × 明日门控 + 空缺资金月频锁定转货币腿）----
     target: dict[str, float] = {}
     for c in panel.columns:
         w = float(w_iv.get(c, 0.0))
@@ -299,6 +305,31 @@ def main(refresh: bool = True) -> int:
         if c in pc.QDII_LEGS:
             w *= qdii[c]["tomorrow"]
         target[c] = w
+
+    # 货币腿锁定值：与回测 freed.groupby(M).transform("first") 同款——
+    #   * 明日进入新月份：锁值 = 明日当天的空缺（用明日底仓+明日门控直接算）；
+    #   * 同月：沿用本月首个交易日锁定的空缺值（月内不变，门控月中翻转
+    #     新增的空退为现金，次月初才入货币腿）。
+    # 为取到本月锁值，用回测同款路径重算门控后的日频权重面板（仅历史，无前视）。
+    base_panel = rp.build_weights(panel, "inverse_vol").shift(1).fillna(0.0)
+    Wg = base_panel.copy()
+    g_pb_daily = pc.pb_gate_daily(panel.index, "triple")
+    for c in pc.A_STOCK_LEGS:
+        if c in Wg.columns:
+            Wg[c] = Wg[c] * g_pb_daily.reindex(Wg.index).ffill().fillna(1.0)
+    for c in pc.QDII_LEGS:
+        if c in Wg.columns:
+            h = pc.qdii_gate_daily(c, Wg.index)
+            Wg[c] = Wg[c] * h.reindex(Wg.index).ffill().fillna(1.0)
+    freed = (base_panel.sum(axis=1) - Wg.sum(axis=1)).clip(lower=0.0)
+    freed_m = freed.groupby(freed.index.to_period("M")).transform("first")
+
+    mmf = pc.MMF_LEG
+    if (as_of + pd.Timedelta(days=1)).to_period("M") != as_of.to_period("M"):
+        freed_lock = max(0.0, float(w_iv.sum()) - sum(target.values()))
+    else:
+        freed_lock = float(freed_m.iloc[-1])
+    target[mmf] = target.get(mmf, 0.0) + freed_lock
     cash = max(0.0, 1.0 - sum(target.values()))
 
     # ---- 动作清单（vs 上一快照的目标权重）----
@@ -308,6 +339,10 @@ def main(refresh: bool = True) -> int:
             prev = json.loads(LIVE_JSON.read_text(encoding="utf-8"))
         except Exception:  # noqa: BLE001
             prev = None
+
+    # 货币腿锁定值是否变化（新月份 → 重新锁定空缺资金）
+    freed_lock_changed = (
+        (as_of + pd.Timedelta(days=1)).to_period("M") != as_of.to_period("M"))
 
     actions = []
     if prev and "target_weights" in prev:
@@ -319,10 +354,12 @@ def main(refresh: bool = True) -> int:
                 continue
             if c in pc.QDII_LEGS and qdii[c]["today"] != qdii[c]["tomorrow"]:
                 why = "QDII 门控减仓" if delta < 0 else "QDII 门控回补"
+            elif c == pc.MMF_LEG and freed_lock_changed:
+                why = "货币腿月度锁定值更新"
             elif c in pc.A_STOCK_LEGS and prev_pb is not None and prev_pb != pb_next:
                 why = f"PB 门控调档 {_fmt_gate(prev_pb)}→{_fmt_gate(pb_next)}"
-            elif is_month_end:
-                why = "月度再平衡"
+            elif is_rebal_day:
+                why = "季度再平衡"
             else:
                 why = "波动率漂移修正"
             actions.append({"code": c, "name": NAMES.get(c, c),
@@ -341,18 +378,24 @@ def main(refresh: bool = True) -> int:
             "panel_stale": bool(data_stale),
             "qdii_premium_stale": prem_stale,
         },
-        "is_month_end": is_month_end,
+        "is_rebal_day": is_rebal_day,
         "pb": {"percentile": round(pct_now, 4) if pct_now is not None else None,
                "level": pb_next, "pct_month": pct_month, "degraded": not pb_ok},
         "invvol_weights": {c: round(float(w_iv.get(c, 0.0)), 4) for c in panel.columns},
         "qdii_gates": qdii,
         "target_weights": {c: round(w, 4) for c, w in target.items()},
         "cash": round(cash, 4),
+        "mmf_freed_lock": round(freed_lock, 4),
         "actions": actions,
         "prev_as_of": (prev or {}).get("as_of"),
         "params": {"pb_rule": "triple", "pb_window_months": pc.PB_WINDOW,
-                   "relchange_window": RELCHANGE_WINDOW, "floor_pct": 1.0,
-                   "min_hold_days": 5, "z_hi": 2.0, "vol_lookback": rp.VOL_LOOKBACK},
+                   "relchange_window": RELCHANGE_WINDOW,
+                   "floor_pct": relr.FLOOR, "z_hi": relr.Z_HI,
+                   "min_hold_days": relr.MIN_HOLD,
+                   "vol_lookback": rp.VOL_LOOKBACK, "vol_p": rp.VOL_P,
+                   "vol_floor_ann_pct": rp.VOL_FLOOR_ANN * 100,
+                   "rebal_freq": rp.REBAL_FREQ, "cash_mmf_leg": pc.MMF_LEG,
+                   "profile": "L6（2026-09-05 起）"},
     }
     RUNS.mkdir(exist_ok=True)
     # 原子写：先写临时文件再替换，避免中断留下半个 JSON 污染次日对比基准
@@ -365,10 +408,11 @@ def main(refresh: bool = True) -> int:
     L = [f"# 三层组合实盘信号（{as_of.date()} 收盘后）\n",
          f"> 数据截至：ETF 收盘 {etf_max} · 沪深300 PB 月频 {legu_last} · "
          f"QDII 溢价 {prem_max}（净值 T+1~T+2 公布滞后，同回测口径）。",
-         f"> {'**明日为月度再平衡执行日**（今日为 ' + str(as_of.strftime('%m')) + ' 月最后交易日）'
-             if is_month_end else '非再平衡日，逆波动底仓沿用上月末权重'}；"
+         f"> {'**明日为季度再平衡执行日**（今日为 ' + as_of.strftime('%Y-%m') + ' 季最后交易日）'
+             if is_rebal_day else '非再平衡日，底仓沿用上季末权重'}；"
          f"PB 门控作用于 {len(pc.A_STOCK_LEGS)} 只 A 股腿、QDII 门控作用于 "
-         f"{len(pc.QDII_LEGS)} 只 QDII 腿（乘法门控，减出部分为现金）。",
+         f"{len(pc.QDII_LEGS)} 只 QDII 腿（乘法门控；月频锁定的空缺资金转入银华日利，"
+         f"月内新增空退为现金）。",
          "> 目标权重是「信号级」目标，实际执行请对照账户真实持仓；"
          f"动作阈值 ±{MIN_ACTION*100:.1f}pp。\n"]
 
@@ -390,8 +434,10 @@ def main(refresh: bool = True) -> int:
              f"（<30% 全仓 / 30~70% 半仓 / ≥70% 空仓）")
     qd_flips = [c for c in pc.QDII_LEGS
                 if qdii[c]["today"] != qdii[c]["tomorrow"]]
-    L.append(f"- **QDII 门控**（溢价一阶差分 60 日 z 飙升回避，floor=1%、"
-             f"min_hold=5）：明日{'**有翻转：' + '、'.join(qd_flips) + '**' if qd_flips else '无翻转'}\n")
+    L.append(f"- **QDII 门控**（溢价一阶差分 60 日 z 飙升回避，z=+{relr.Z_HI}、"
+             f"floor={relr.FLOOR}%、min_hold={relr.MIN_HOLD}）："
+             f"明日{'**有翻转：' + '、'.join(qd_flips) + '**' if qd_flips else '无翻转'}"
+             f"；空缺资金月频锁定转入银华日利（当前锁定 {freed_lock*100:.1f}%）\n")
     L.append("| 代码 | 名称 | 溢价% | z | 今日 | 明日 | 状态持续(日) | 数据截至 |")
     L.append("|---|---|---|---|---|---|---|---|")
     for c in pc.QDII_LEGS:
@@ -402,7 +448,7 @@ def main(refresh: bool = True) -> int:
                  f"| {v['days_in_state']} | {v['prem_last'] or '—'} |")
 
     L.append("\n## 2. 明日目标持仓\n")
-    L.append("| 代码 | 名称 | 层 | 逆波动 | PB | QDII | 目标权重 | 较上快照 |")
+    L.append("| 代码 | 名称 | 层 | 底仓 | PB | QDII | 目标权重 | 较上快照 |")
     L.append("|---|---|---|---|---|---|---|---|")
     prev_w = (prev or {}).get("target_weights", {})
     for c in sorted(panel.columns, key=lambda x: -target[x]):
@@ -417,7 +463,7 @@ def main(refresh: bool = True) -> int:
         L.append(f"| {c} | {NAMES.get(c, c)} | {layer} "
                  f"| {float(w_iv.get(c, 0.0))*100:.1f}% | {pb_g} | {qd_g} "
                  f"| **{target[c]*100:.1f}%** | {dcol} |")
-    L.append(f"| — | **现金（门控减出）** | — | — | — | — | **{cash*100:.1f}%** | — |")
+    L.append(f"| — | **现金（月内门控减出，未入货币腿）** | — | — | — | — | **{cash*100:.1f}%** | — |")
 
     L.append("\n## 3. 动作清单（较上一快照"
              + (f" {snap['prev_as_of']}" if snap["prev_as_of"] else "")
@@ -434,19 +480,23 @@ def main(refresh: bool = True) -> int:
                      f"| {a['to']*100:.1f}% | {a['delta']*100:+.1f}pp | {a['reason']} |")
 
     L.append("\n## 4. 口径备忘\n")
-    L.append("- 逆波动：月末前 60 日波动率倒数定权（`risk_parity.build_weights`），"
-             "明日权重 = 面板末行。")
+    L.append("- 底仓：w ∝ 1/σ^1.2、波动率地板 6%（年化）、季频再平衡"
+             "（`risk_parity.build_weights`），明日权重 = 面板末行。")
     L.append("- PB 门控：月末分位三档 shift(1) 应用（回测原样口径，t+1 月使用 "
              "t−1 月末分位）；数据源乐咕月频，月初更新上月末点。")
-    L.append("- QDII 门控：z>+2 且溢价>1% 次日空仓，空仓 ≥5 日且 z≤+2 回补；"
+    L.append(f"- QDII 门控：z>+{relr.Z_HI} 且溢价>{relr.FLOOR}% 次日空仓，空仓 "
+             f"≥{relr.MIN_HOLD} 日且 z≤+{relr.Z_HI} 回补；"
              "溢价按最新可得净值计算，存在 1~2 日信息滞后。")
-    L.append("- 动作归因优先级：QDII 门控 > PB 调档 > 月度再平衡 > 漂移修正。")
+    L.append("- 空缺资金月频锁定转入银华日利 511880（月内新增空缺为现金，"
+             "次月初才入货币腿）；锁值 = 当月首个交易日的空缺。")
+    L.append("- 动作归因优先级：QDII 门控 > 货币腿锁定更新 > PB 调档 > "
+             "季度再平衡 > 漂移修正。")
     LIVE_MD.write_text("\n".join(L), encoding="utf-8")
 
     # ---- 控制台摘要（qdii_daily 日志只回显尾部 12 行，摘要放最后）----
     print("=" * 64)
     print(f"三层组合实盘信号（ETF 截至 {etf_max}，PB {legu_last}，溢价 {prem_max}）")
-    print(f"  再平衡：{'明日执行月度再平衡（今日为月末）' if is_month_end else '非再平衡日'}"
+    print(f"  再平衡：{'明日执行季度再平衡（今日为季末）' if is_rebal_day else '非再平衡日'}"
           + ("（⚠️ 数据滞后，判定可能失真）" if data_stale else ""))
     print(f"  PB 门控：沪深300 PB 分位 {pct_str} → A 股腿档位 {_fmt_gate(pb_next)}"
           + ("（⚠️ 降级全仓）" if not pb_ok else ""))

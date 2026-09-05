@@ -220,7 +220,7 @@ def build_report(as_of: str, premium, backtest, live, ledger, nav_row,
       f"{sum(1 for g in gates.values() if g.get('tomorrow') == 1.0)} 只、"
       f"空仓 {sum(1 for g in gates.values() if g.get('tomorrow') == 0.0)} 只")
     A(f"- **目标现金比**：{pct(live.get('cash', 0))}")
-    A(f"- **是否月末再平衡日**：{'是（月频再平衡触发）' if live.get('is_month_end') else '否'}")
+    A(f"- **是否季度再平衡日**：{'是（季频再平衡触发）' if live.get('is_rebal_day') else '否'}")
     A(f"- **信号层动作清单**：{len(live.get('actions', []))} 项"
       f"（信号层只反映「目标权重较上一日的变化」，与下方对账层的偏离纠偏是两回事）")
     A("")
@@ -320,8 +320,8 @@ def build_report(as_of: str, premium, backtest, live, ledger, nav_row,
             f"{r['code']} {r['official_premium_pct']}%" for r in hi)
             + " —— 若用 QDII_ABS 口径（溢价>3% 即空仓）会结构性踏空；"
               "现行 THREE 口径用 z 值变化信号，高溢价平稳期继续持有。")
-    if live.get("is_month_end"):
-        risks.append("月末再平衡日：目标权重按逆波动重算，换手可能高于平日。")
+    if live.get("is_rebal_day"):
+        risks.append("季度再平衡日：目标权重按底仓（w∝1/σ^1.2、地板 6%）重算，换手可能高于平日。")
     if pb.get("percentile", 0) > 0.7:
         risks.append(f"PB 分位 {pct(pb['percentile'],1)} 处于高位，A 股腿已空仓，"
                      "若估值回落需等下月信号才回补。")
