@@ -92,32 +92,17 @@ def _slice_ranges(start: str, end: str, step_days: int = 365):
         cur = seg_end + pd.Timedelta(days=1)
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser(description="Fetch OHLCV via vibe-trading")
-    parser.add_argument("--codes", nargs="+", required=True)
-    parser.add_argument("--start", required=True, help="YYYY-MM-DD")
-    parser.add_argument("--end", required=True, help="YYYY-MM-DD")
-    parser.add_argument("--out-dir", required=True)
-    parser.add_argument("--source", default="auto",
-                        help="auto/tencent/mootdx/eastmoney/baostock/akshare/tushare")
-    parser.add_argument("--max-rows", type=int, default=0,
-                        help="0=不限制(vibe 默认 250 会触发等距降采样，务必保持 0)")
-    parser.add_argument("--slice-days", type=int, default=365,
-                        help="分段拉取的窗口天数，须保证段内 K 线数 < 500")
-    args = parser.parse_args()
+# --ensure-date 重试时依次尝试的起始日偏移（天）。腾讯上游按完整 URL
+# （含 code+start+end）缓存，个别 (code, start) 组合会稳定返回「少了最新一根」
+# 的旧序列；换起始日即换缓存键，实测单只命中率约 90%，多试几次 ≈ 99.9%。
+_ENSURE_OFFSETS = (1, -1, 2, -2, 3)
 
-    # 关键：cwd 必须不含 src/ 目录（由调用方保证），此处再兜底移除 cwd
-    # 与 ''，确保 import src 只会命中 site-packages。
-    cwd_str = str(Path.cwd().resolve())
-    for entry in ("", cwd_str):
-        while entry in sys.path:
-            sys.path.remove(entry)
 
-    from src.market_data import fetch_market_data  # vibe-trading 的 src
+def _fetch_all(fetch_market_data, codes, start, end, source, max_rows, slice_days):
+    """按 [start, end] 分段拉取一批代码，返回 (collected, provenance)。
 
-    out_dir = Path(args.out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-
+    collected 形如 {code: [DataFrame, ...]}（多段拼接前的原始分块）。
+    """
     # ⚠️ vibe-trading 的 tencent loader 有截断 bug：
     #   腾讯 fqkline 接口单次最多 500 根，且当窗口内 K 线数 > 500 时返回的是
     #   「end_date 往前 500 根」（末尾对齐），而 vibe 的 _fetch_one 分页却假设
@@ -125,23 +110,23 @@ def main() -> int:
     #   最终任何 >500 根的请求都静默退化为「最近 500 根」。
     #   （实测：请求 2024-01-01~2026-06-30 返回 500 根，first=2024-06-06）
     #   RSRS 的 M=600 标准化窗口需要至少 600 根，故此处按年分段拉取再拼接。
-    slices = list(_slice_ranges(args.start, args.end, step_days=args.slice_days))
+    slices = list(_slice_ranges(start, end, step_days=slice_days))
     if len(slices) > 1:
         print(f"[broker] 分段拉取：{len(slices)} 段 ({slices[0][0]} ~ {slices[-1][1]})，"
               f"规避 vibe 500 根截断")
 
-    collected: dict[str, list[pd.DataFrame]] = {c: [] for c in args.codes}
+    collected: dict[str, list[pd.DataFrame]] = {}
     provenance: dict[str, Any] = {}
 
     for seg_start, seg_end in slices:
         try:
             result = fetch_market_data(
-                codes=list(args.codes),
+                codes=list(codes),
                 start_date=seg_start,
                 end_date=seg_end,
-                source=args.source,
+                source=source,
                 interval="1D",
-                max_rows=args.max_rows,
+                max_rows=max_rows,
                 include_provenance=True,
             )
         except Exception as exc:  # noqa: BLE001
@@ -166,11 +151,88 @@ def main() -> int:
             if df is not None and not df.empty:
                 collected.setdefault(code, []).append(df)
 
+    return collected, provenance
+
+
+def _max_date(collected: dict[str, list[pd.DataFrame]], code: str):
+    """返回某代码已取到的最大日期（无数据返回 None）。"""
+    chunks = collected.get(code) or []
+    if not chunks:
+        return None
+    return max(ch.index.max() for ch in chunks)
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Fetch OHLCV via vibe-trading")
+    parser.add_argument("--codes", nargs="+", required=True)
+    parser.add_argument("--start", required=True, help="YYYY-MM-DD")
+    parser.add_argument("--end", required=True, help="YYYY-MM-DD")
+    parser.add_argument("--out-dir", required=True)
+    parser.add_argument("--source", default="auto",
+                        help="auto/tencent/mootdx/eastmoney/baostock/akshare/tushare")
+    parser.add_argument("--max-rows", type=int, default=0,
+                        help="0=不限制(vibe 默认 250 会触发等距降采样，务必保持 0)")
+    parser.add_argument("--slice-days", type=int, default=365,
+                        help="分段拉取的窗口天数，须保证段内 K 线数 < 500")
+    parser.add_argument("--ensure-date", default="",
+                        help="YYYY-MM-DD；若某代码取回的末日期早于此日，"
+                             "自动换起始日重试（规避腾讯上游按 URL 缓存导致的"
+                             "「静默少给最新一根」）")
+    args = parser.parse_args()
+
+    # 关键：cwd 必须不含 src/ 目录（由调用方保证），此处再兜底移除 cwd
+    # 与 ''，确保 import src 只会命中 site-packages。
+    cwd_str = str(Path.cwd().resolve())
+    for entry in ("", cwd_str):
+        while entry in sys.path:
+            sys.path.remove(entry)
+
+    from src.market_data import fetch_market_data  # vibe-trading 的 src
+
+    out_dir = Path(args.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    collected, provenance = _fetch_all(
+        fetch_market_data, args.codes, args.start, args.end,
+        args.source, args.max_rows, args.slice_days,
+    )
+
+    # --ensure-date：腾讯上游会按完整 URL 缓存，个别 (code, start) 稳定返回
+    # 「少了最新一根」的旧序列。逐次换起始日重试，取末日期最新的结果。
+    if args.ensure_date:
+        target = pd.Timestamp(args.ensure_date)
+        for off in _ENSURE_OFFSETS:
+            behind = [c for c in args.codes
+                      if (_max_date(collected, c) is None
+                          or _max_date(collected, c) < target)]
+            if not behind:
+                break
+            alt_start = (pd.Timestamp(args.start) + pd.Timedelta(days=off)).strftime("%Y-%m-%d")
+            if alt_start >= args.end:
+                continue
+            print(f"[broker] ensure-date={target.date()}：{len(behind)} 只落后，"
+                  f"改用 start={alt_start} 重试")
+            extra, prov2 = _fetch_all(
+                fetch_market_data, behind, alt_start, args.end,
+                args.source, args.max_rows, args.slice_days,
+            )
+            for code, chunks in extra.items():
+                collected.setdefault(code, []).extend(chunks)
+            provenance.update(prov2)
+
+        still = [c for c in args.codes
+                 if (_max_date(collected, c) is None
+                     or _max_date(collected, c) < target)]
+        if still:
+            print(f"[broker] ⚠️ 重试后仍未取到 {target.date()}：{', '.join(still)}")
+
     manifest = {
         "start": args.start,
         "end": args.end,
         "source": args.source,
-        "slices": len(slices),
+        "slices": len(list(_slice_ranges(args.start, args.end,
+                                         step_days=args.slice_days))),
+        "ensure_date": args.ensure_date or None,
         "files": {},
     }
     failed = []

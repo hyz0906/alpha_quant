@@ -167,6 +167,13 @@ tests/              4 个测试文件（test_gates/test_rsrs/test_llm/test_db_co
 - **tencent loader 有 500 根静默截断**（vibe bug）：broker 按 `--slice-days 365`
   分段拉取绕开（2021-2026 可拿 1327 根）。**务必传 `max_rows=0`**（默认 250 会等距降采样）。
 - `fetch_market_data` 返回 **`list[dict]`**（非 DataFrame），日期字段名 `trade_date`。
+- **⚠️ 上游会静默少给最新一根**（2026-09-07 定位）：腾讯按完整 URL（含
+  code+start+end）缓存，个别 `(code, start)` 组合稳定返回「末日期少一天」
+  的旧序列且报成功，同一 start 重复请求结果稳定复现。broker 新增
+  **`--ensure-date D`**：末日期 < D 的代码自动换起始日重试（偏移 +1/−1/
+  +2/−2/+3 天，取最新），单只命中率约 90%。`portfolio_live.refresh_etf_closes`
+  已接入——第一遍拉完取各腿最大末日期作目标，对落后者重试，仍落后则按腿名
+  告警。**任何新增调用方都应传 `--ensure-date`，或至少做取后末日期校验。**
 - 数据正确性核验：拉完后对照 `data/<code>.csv` 与新浪/东财收盘价，确认没退化成不复权。
 - 完整坑列表见 `WORKFLOW.md` §6（10 条实测 bug）。
 

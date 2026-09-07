@@ -86,12 +86,48 @@ PREM_STALE_DAYS = 5    # 溢价缓存末日期滞后 panel 超过 5 个自然日
 # --------------------------------------------------------------------------- #
 # 数据刷新（全部降级容忍）
 # --------------------------------------------------------------------------- #
+def _run_broker(codes: list[str], start: str, end: str, tmp: Path,
+                ensure_date: str | None = None) -> dict[str, str]:
+    """调 broker 子进程拉数，返回 {code: 末日期}（读 manifest.json）。
+
+    ensure_date 非空时，broker 会对末日期不足的代码自动换起始日重试。
+    """
+    cmd = [sys.executable, "-X", "utf8",
+           str(ROOT / "scripts" / "vibe_fetch_broker.py"),
+           "--codes", *codes, "--start", start, "--end", end,
+           "--out-dir", str(tmp)]
+    if ensure_date:
+        cmd += ["--ensure-date", ensure_date]
+    try:
+        cp = subprocess.run(cmd, cwd=str(Path.home()), capture_output=True,
+                            text=True, timeout=900)
+        if cp.returncode != 0:
+            print(f"[live] ⚠️ broker 退出码 {cp.returncode}（部分失败可容忍）")
+    except Exception as e:  # noqa: BLE001
+        print(f"[live] ⚠️ broker 调用异常 {type(e).__name__}: {e}")
+        return {}
+    mf = tmp / "manifest.json"
+    if not mf.exists():
+        return {}
+    try:
+        files = json.loads(mf.read_text(encoding="utf-8")).get("files") or {}
+    except Exception as e:  # noqa: BLE001
+        print(f"[live] ⚠️ manifest 解析失败 {type(e).__name__}: {e}")
+        return {}
+    return {c: v["last"] for c, v in files.items() if isinstance(v, dict) and v.get("last")}
+
+
 def refresh_etf_closes(codes: list[str]) -> dict[str, str]:
     """增量刷新 ETF 收盘价（vibe broker，tencent 前复权链，cwd=$HOME 子进程）。
 
     只拉「最后日期 < 今日」的代码；窗口 = min(最后日期)−20 天 ~ 今日，
     与旧缓存重叠区以新数据为准。任一步失败只告警，保留旧数据。
     返回 {code: 最新日期}。
+
+    取后校验：上游（腾讯 fqkline）按完整 URL 缓存，个别代码会稳定少给最新
+    一根 K 线且报成功（2026-09-07 实测 18 腿中 5 腿卡在 3 天前，零告警）。
+    故第一遍拉完后以本批最大末日期为目标，对落后的代码带 --ensure-date
+    重试（broker 内部换起始日），仍落后则按腿名告警。
     """
     today = pd.Timestamp(datetime.now().date())
     lasts: dict[str, str] = {}
@@ -112,15 +148,20 @@ def refresh_etf_closes(codes: list[str]) -> dict[str, str]:
     end = today.strftime("%Y-%m-%d")
     tmp = DATA_DIR / "_live_tmp"
     print(f"[live] 刷新 {len(stale)} 只 ETF 收盘价（{start} ~ {end}）...")
-    cmd = [sys.executable, "-X", "utf8",
-           str(ROOT / "scripts" / "vibe_fetch_broker.py"),
-           "--codes", *stale, "--start", start, "--end", end,
-           "--out-dir", str(tmp)]
+    got = _run_broker(stale, start, end, tmp)
+
+    # 上游（腾讯 fqkline）按完整 URL 缓存，个别代码会稳定少给最新一根 K 线
+    # （2026-09-07 实测：18 腿里 5 腿卡在 3 天前，且无任何失败告警）。
+    # 以本批取到的最大末日期为目标，对落后的代码让 broker 换起始日重试。
+    target = max(got.values()) if got else ""
+    if target:
+        behind = [c for c in stale if got.get(c) and got[c] < target]
+        if behind:
+            print(f"[live] ⚠️ {len(behind)} 只未取到最新收盘 {target}，"
+                  f"换起始日重试：{', '.join(behind)}")
+            got.update(_run_broker(behind, start, end, tmp, ensure_date=target))
+
     try:
-        cp = subprocess.run(cmd, cwd=str(Path.home()), capture_output=True,
-                            text=True, timeout=600)
-        if cp.returncode != 0:
-            print(f"[live] ⚠️ broker 退出码 {cp.returncode}（部分失败可容忍）")
         for c in stale:
             new_p, old_p = tmp / f"{c}.csv", DATA_DIR / f"{c}.csv"
             if not new_p.exists():
@@ -137,6 +178,8 @@ def refresh_etf_closes(codes: list[str]) -> dict[str, str]:
                 lasts[c] = str(merged["date"].max().date())
             else:
                 print(f"[live] ⚠️ {c} 合并结果异常（行数/日期倒退），保留旧数据")
+            if target and lasts[c] < target:
+                print(f"[live] ⚠️ {c} 合并后仍落后：{lasts[c]} < {target}")
     except Exception as e:  # noqa: BLE001
         print(f"[live] ⚠️ 收盘价刷新异常 {type(e).__name__}: {e}，用旧数据继续")
     return lasts
@@ -512,7 +555,14 @@ def main(refresh: bool = True) -> int:
 
     # ---- 控制台摘要（qdii_daily 日志只回显尾部 12 行，摘要放最后）----
     print("=" * 64)
-    print(f"三层组合实盘信号（ETF 截至 {etf_max}，PB {legu_last}，溢价 {prem_max}）")
+    # etf_max 是各腿末日期的【最大值】，as_of 是【交集日】——上游少给最新一根时
+    # 两者会不一致，只打最大值会掩盖滞后（2026-09-07 即因此误判），故都打。
+    print(f"三层组合实盘信号（ETF 最新 {etf_max}，交集 as_of {as_of.date()}，"
+          f"PB {legu_last}，溢价 {prem_max}）")
+    stale_legs = {c: d for c, d in etf_last.items() if d < etf_max}
+    if stale_legs:
+        print(f"  ⚠️ {len(stale_legs)} 只未取到最新收盘 {etf_max}："
+              + "、".join(f"{c}({d})" for c, d in sorted(stale_legs.items())))
     print(f"  再平衡：{'明日执行季度再平衡（今日为季末）' if is_rebal_day else '非再平衡日'}"
           + ("（⚠️ 数据滞后，判定可能失真）" if data_stale else ""))
     print(f"  PB 门控：沪深300 PB 分位 {pct_str} → A 股腿档位 {_fmt_gate(pb_next)}"
