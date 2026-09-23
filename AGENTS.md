@@ -174,6 +174,17 @@ tests/              4 个测试文件（test_gates/test_rsrs/test_llm/test_db_co
 - **影子 IOPV**（`qdii_calc.py`）：`IOPV_now = NAV_last × (1 + Future%) × Rate_now / Rate_base`，
   底层指数映射见 `QDII_UNDERLYING`（纳指→.IXIC、标普→.INX、中概→.IXIC、德国→DAX、
   恒生→HSI、日经→N225），汇率为中行日频牌价。
+- **`qdii_monitor.py` 双路径（2026-09-23 起）**：东财行情推送集群（push2/push2delay）
+  会**按 IP 限流拒连**（`RemoteDisconnected`，实测与本地网络、代码均无关），
+  一旦 `ak.fund_etf_spot_em()` 失败，脚本自动降级到**官方溢价缓存序列**
+  （`data/fundamental/qdii_premium_<code>.csv`，由 `qdii_backtest.py --refresh`
+  产出，走 fund.eastmoney.com 不受影响）重建同一张表——price←缓存 `close`、
+  官方溢价←缓存 `premium`、z←`relchange_zscore(缓存)`，影子 IOPV 显式置空。
+  **降级只影响 §3 展示，不改任何门控输入**，且与门控同源同口径（实测 6 腿
+  溢价/z 与 `qdii_gates` 逐只一致）。判据：`runs/qdii_premium.json` 的
+  `mode`（`live`/`degraded`）、`degraded`、`premium_as_of`；`daily_advice.py` §2
+  会显式告警。⚠️ **降级路径的 JSON schema 必须与主路径同构**
+  （影子相关字段填 `None`），否则 `daily_advice.py` §3 会崩。
 
 ## 7. Vibe-Trading 集成要点（仅 `vibe_fetch_broker.py` 在用）
 
@@ -203,7 +214,9 @@ tests/              4 个测试文件（test_gates/test_rsrs/test_llm/test_db_co
    与回测 T→T+1 语义一致。不是 bug。
 3. **QDII 相对变化信号**（`relchange_zscore`）：2026 起纳指绝对溢价结构性 >3%
    （额度告罄），绝对阈值失效，改用一阶差分 z——`qdii_monitor.py` 的 z 口径必须与
-   回测一致（滞后 1 期），不要改回绝对溢价告警。
+   回测一致（滞后 1 期），不要改回绝对溢价告警。**降级模式
+   （`qdii_monitor.degraded_rows()`）同样用 `relchange_zscore` 算官方溢价缓存序列，
+   正是为保住这条「同口径」约束，不要换成别的算法。**
 4. **门控空缺不归一**：门控减出的资金 = 现金，**不要**重新归一给其他腿（见 §5.2）。
 5. **21:30 定时**：东财晚间才更新 QDII 当日净值，21:30 跑可把门控滞后从 2 天降到
    0~1 天。**不要改回 15:30**（除非重新量化滞后代价，见 `scripts/archive/gate_lag_test.py`）。

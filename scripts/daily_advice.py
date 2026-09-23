@@ -47,6 +47,13 @@ def _json(p: Path):
     return json.load(open(p, encoding="utf-8"))
 
 
+def _dash(x, suffix: str = "") -> str:
+    """报告表格用：缺失值统一渲染为 —（避免出现 None% / nan%）。"""
+    if x is None or (isinstance(x, float) and x != x):
+        return "—"
+    return f"{x}{suffix}"
+
+
 def last_close(code: str) -> tuple[str, float] | None:
     """取 CSV 最后一行 (date, close)。"""
     f = DATA / f"{code}.csv"
@@ -169,6 +176,14 @@ def build_report(as_of: str, premium, backtest, live, ledger, nav_row,
         issues.append(f"⚠️ QDII 溢价数据滞后：{prem_stale}")
     if err_size > 0:
         issues.append(f"⚠️ qdii_daily.err.log 非空（{err_size} 字节）")
+    # 溢价快照降级：东财实时行情（push2/push2delay）被限流时的兜底路径。
+    # 此模式下 §3 的官方溢价/z 取自官方溢价缓存序列（与门控同源同口径、可用），
+    # 但影子 IOPV 无法计算——必须在数据健康里点明，不能静默。
+    if premium.get("degraded"):
+        issues.append(
+            f"⚠️ 溢价快照为**降级模式**（东财实时行情不可用）：§3 官方溢价/z 取自"
+            f"官方溢价缓存（至 {premium.get('premium_as_of') or '未知'}，与门控同源同口径、"
+            f"可直接使用），**影子 IOPV 不可用**；原因：{premium.get('degrade_reason','')}")
     # 快照只需是「今天」跑的即可；as_of 是数据日期，与快照日期不同属正常。
     snap_day = premium.get("timestamp", "")[:10]
     if not snap_day:
@@ -198,9 +213,15 @@ def build_report(as_of: str, premium, backtest, live, ledger, nav_row,
         g = gates.get(c, {})
         gt = f"{g.get('today')}→{g.get('tomorrow')}" if g else "-"
         flag = " **翻转**" if g and g.get("today") != g.get("tomorrow") else ""
-        A(f"| {c} | {r.get('name','')} | {r.get('market','')} | {r.get('price')} | "
-          f"{r.get('official_premium_pct')}% | {r.get('shadow_premium_pct')}% | "
-          f"{r.get('rel_zscore')} | {r.get('rel_alert','')} | {gt}{flag} |")
+        A(f"| {c} | {r.get('name','')} | {r.get('market','')} | {_dash(r.get('price'))} | "
+          f"{_dash(r.get('official_premium_pct'), '%')} | {_dash(r.get('shadow_premium_pct'), '%')} | "
+          f"{_dash(r.get('rel_zscore'))} | {r.get('rel_alert','')} | {gt}{flag} |")
+    if premium.get("degraded"):
+        A("")
+        A(f"> ⚠️ **降级模式**：本表官方溢价/z 取自官方溢价缓存（至 "
+          f"{premium.get('premium_as_of') or '未知'}），与 QDII 门控**同一数据源同口径**；"
+          f"影子溢价与价格列为 — 属预期（东财实时行情不可用）。判翻转仍以 "
+          f"`portfolio_live.json → qdii_gates` 为准。")
     flips = [c for c, g in gates.items() if g.get("today") != g.get("tomorrow")]
     A("")
     if flips:
